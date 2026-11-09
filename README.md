@@ -8,6 +8,8 @@ Mods for [Claude Code](https://code.claude.com): small plugins that change its i
 |---|---|
 | [crew-progress](plugins/crew-progress) | Progress bar above the prompt and a live panel of subagents. Works in any session, with no setup. |
 
+![crew-progress: the progress bar above the prompt and the Crew panel beside it](plugins/crew-progress/assets/demo.png)
+
 ## Installing a mod
 
 At the prompt of a terminal session, with the mod's name:

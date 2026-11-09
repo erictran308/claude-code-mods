@@ -2,6 +2,10 @@
 
 A Claude Code mod that shows how far along Claude is: a progress bar above the prompt and a live panel of every subagent. It works in any session, with no setup and no companion skill.
 
+![The progress bar above the prompt and the Crew panel beside it, with two subagents running and two finished](assets/demo.png)
+
+*Drawn from the mod's own rendering code with sample data.*
+
 ## Install
 
 At the prompt of a terminal session:
