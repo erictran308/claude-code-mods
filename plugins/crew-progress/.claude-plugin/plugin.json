@@ -1,0 +1,26 @@
+{
+  "name": "crew-progress",
+  "version": "0.1.0",
+  "description": "Progress bar above the prompt and a live panel of subagents (/crew). Works in any session: no companion skill, no setup.",
+  "author": { "name": "Eric Tran", "url": "https://github.com/erictran308" },
+  "homepage": "https://github.com/erictran308/claude-code-mods/tree/main/plugins/crew-progress",
+  "repository": "https://github.com/erictran308/claude-code-mods",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "autoOpen": {
+      "type": "string",
+      "title": "Open the crew panel",
+      "description": "first-agent: once per session, when the first subagent starts. never: only with /crew or the button on the bar.",
+      "default": "first-agent",
+      "options": ["first-agent", "never"]
+    },
+    "glyphs": {
+      "type": "string",
+      "title": "Terminal icons",
+      "description": "nerd: rounded progress bar and icons, needs a Nerd Font in your terminal. plain: standard Unicode only.",
+      "default": "nerd",
+      "options": ["nerd", "plain"]
+    }
+  },
+  "license": "MIT"
+}
