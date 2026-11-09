@@ -2,6 +2,10 @@
 
 A Claude Code mod that puts your project's file tree beside the chat and lights up the files Claude reads, edits and commits, as it happens.
 
+![The file tree beside the chat, with one file being edited, others marked edited, committed and read, and a card summing up the turn](assets/demo.png)
+
+*Drawn from the mod's own rendering code with sample data.*
+
 ## Install
 
 At the prompt of a terminal session:
