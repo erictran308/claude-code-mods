@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ImageSource, Register, RenderElement } from 'claude-code'
 
-import type { Activity, Change, Entry, GitView, Layout, Listing, Touch, TouchKind } from '../types'
+import type { Activity, Change, Entry, GitView, Layout, Listing, Touch, TouchKind, TreeView } from '../types'
 import {
   BOT_COLUMNS,
   BOT_ROWS,
@@ -20,10 +20,12 @@ import type { Glyphs } from './art'
 import type { HitAction, HitProps } from './hit'
 import {
   NO_GIT,
+  TMUX_IMAGE_QUESTION,
   appendTrail,
   applyTouches,
   basename,
   buildRows,
+  buildTouchedRows,
   cellWidth,
   clip,
   commitsSince,
@@ -58,6 +60,7 @@ import {
   visibleFolders,
   withClosed,
   withPinned,
+  withTreeSetting,
   workingKinds,
 } from './model'
 import type { IconMap, ImagePlan, Planned, TreeRow } from './model'
@@ -73,6 +76,7 @@ const FULL_SYNC_EVERY = 6
 const SCAN_DELAY_MS = 350
 const FOLLOW_DELAY_MS = 260
 const GIT_TIMEOUT_MS = 6000
+const TMUX_TIMEOUT_MS = 1000
 const PANE_INSET = 2
 const MAX_OPEN_FOLDERS = 200
 const MAX_REFLOG = 50
@@ -103,11 +107,14 @@ const HOVER = '#26263a'
 
 const LABELS: Record<TouchKind, string> = { read: 'read', edited: 'edited', committed: 'committed' }
 
-const initialLayout = (project = ''): Layout => ({
+const initialLayout = (project = '', treeView: TreeView = 'touched'): Layout => ({
   project,
   root: project,
   expanded: [],
   autoOpened: {},
+  treeView,
+  touchedOnly: treeView === 'touched',
+  touchedClosed: [],
   query: '',
   showHidden: true,
   showSizes: false,
@@ -119,7 +126,7 @@ const initialActivity = (): Activity => ({ turn: 0, isWorking: false, working: [
 
 // Change a tag when that value's fields change: what an earlier version stored
 // outlives a reload, and the tag makes the new code decline it.
-const layout = atom({ plugin: 'file-tree', key: 'layout' } as const, initialLayout(), { shape: 'layout-1' })
+const layout = atom({ plugin: 'file-tree', key: 'layout' } as const, initialLayout(), { shape: 'layout-3' })
 const listings = atom({ plugin: 'file-tree', key: 'listings' } as const, {}, { shape: 'listings-1' })
 const gitView = atom({ plugin: 'file-tree', key: 'git' } as const, NO_GIT, { shape: 'git-2' })
 const touches = atom({ plugin: 'file-tree', key: 'touches' } as const, [], { shape: 'touches-2' })
@@ -501,19 +508,33 @@ async function poll($: EngineInterface, isFull: boolean): Promise<void> {
   if (isFull || didChange || stamp !== view.stamp) await syncGit($)
 }
 
+/** Undefined when tmux could not be asked: only its answer says whether pictures get through. */
+const askTmux = async ($: EngineInterface, pane: string): Promise<string | undefined> => {
+  const answer = await $.process.run(['tmux', 'display-message', '-p', '-t', pane, TMUX_IMAGE_QUESTION], { timeoutMs: TMUX_TIMEOUT_MS }).catch(() => null)
+  return answer?.exitCode === 0 ? answer.stdout : undefined
+}
+
 async function loadIcons($: EngineInterface, setting: unknown): Promise<void> {
+  const tmux = await $.env.get('TMUX')
+  const tmuxPane = await $.env.get('TMUX_PANE')
+  const tmuxAnswer = tmux && tmuxPane && setting !== 'chips' ? await askTmux($, tmuxPane) : undefined
   // Each name written out: the engine lists what a mod reads from the source.
-  imagePlan = imagePlanOf(setting, {
-    TERM: await $.env.get('TERM'),
-    TERM_PROGRAM: await $.env.get('TERM_PROGRAM'),
-    TERM_PROGRAM_VERSION: await $.env.get('TERM_PROGRAM_VERSION'),
-    TMUX: await $.env.get('TMUX'),
-    SSH_CONNECTION: await $.env.get('SSH_CONNECTION'),
-    SSH_TTY: await $.env.get('SSH_TTY'),
-    KITTY_WINDOW_ID: await $.env.get('KITTY_WINDOW_ID'),
-    ZELLIJ: await $.env.get('ZELLIJ'),
-    STY: await $.env.get('STY'),
-  })
+  imagePlan = imagePlanOf(
+    setting,
+    {
+      TERM: await $.env.get('TERM'),
+      TERM_PROGRAM: await $.env.get('TERM_PROGRAM'),
+      TERM_PROGRAM_VERSION: await $.env.get('TERM_PROGRAM_VERSION'),
+      TMUX: tmux,
+      SSH_CONNECTION: await $.env.get('SSH_CONNECTION'),
+      SSH_TTY: await $.env.get('SSH_TTY'),
+      KITTY_WINDOW_ID: await $.env.get('KITTY_WINDOW_ID'),
+      ZELLIJ: await $.env.get('ZELLIJ'),
+      STY: await $.env.get('STY'),
+      CLAUDE_CODE_FORCE_TERMINAL_IMAGES: await $.env.get('CLAUDE_CODE_FORCE_TERMINAL_IMAGES'),
+    },
+    tmuxAnswer,
+  )
   if (!imagePlan) return
   iconsDir = `${$.plugin.root}/assets/icons`
   iconMap = parseIconMap(await $.fs.read(`${iconsDir}/map.json`))
@@ -580,7 +601,14 @@ async function showFile($: EngineInterface, path: string): Promise<void> {
     $.ui.toast(`${shownPath(root, path, home)} is outside this tree.`)
     return
   }
-  await update($, layout, prev => ({ ...prev, query: '' }))
+  // A file Claude has not handled is only in the whole tree.
+  const isTouched = (await read($, touches)).some(touch => touch.path === path)
+  await update($, layout, prev => ({
+    ...prev,
+    query: '',
+    touchedOnly: prev.touchedOnly && isTouched,
+    touchedClosed: prev.touchedClosed.filter(dir => !isInside(dir, path)),
+  }))
   await openFoldersFor($, [path], null)
   $.clock.after(FOLLOW_DELAY_MS, () => {
     void $.ui.scroll({ in: PANE, to: { key: rowKey(path) }, block: 'center' }).catch(() => undefined)
@@ -588,6 +616,13 @@ async function showFile($: EngineInterface, path: string): Promise<void> {
 }
 
 async function toggleFolder($: EngineInterface, path: string): Promise<void> {
+  if ((await read($, layout)).touchedOnly) {
+    await update($, layout, prev => ({
+      ...prev,
+      touchedClosed: prev.touchedClosed.includes(path) ? prev.touchedClosed.filter(dir => dir !== path) : [...prev.touchedClosed, path],
+    }))
+    return
+  }
   const isOpen = (await read($, layout)).expanded.includes(path) && (await read($, listings))[path] !== undefined
   await update($, layout, prev =>
     isOpen
@@ -625,7 +660,8 @@ export const register: Register = (on, options) => {
 
     home = posix((await $.env.get('HOME')) ?? '')
     const cwd = posix(await $.session.cwd())
-    await update($, layout, prev => (prev.project ? prev : initialLayout(cwd)))
+    const treeView: TreeView = options.treeView === 'all' ? 'all' : 'touched'
+    await update($, layout, prev => (prev.project ? withTreeSetting(prev, treeView) : initialLayout(cwd, treeView)))
     await quietly(() => loadIcons($, options.icons))
     // A search kept through a reload has lost its index, which lives only in memory.
     if ((await read($, layout)).query) await quietly(() => ensureIndex($))
@@ -658,7 +694,7 @@ export const register: Register = (on, options) => {
     if (e.reason === 'clear' || e.reason === 'resume') {
       await update($, touches, () => [])
       await update($, activity, initialActivity)
-      await update($, layout, prev => ({ ...prev, autoOpened: {}, hasAutoOpened: false }))
+      await update($, layout, prev => ({ ...prev, autoOpened: {}, touchedClosed: [], hasAutoOpened: false }))
     }
     return next(e)
   })
@@ -768,15 +804,23 @@ export const register: Register = (on, options) => {
       return inWork.get(path) ?? (touch && touch.liveUntil > at ? touch.lastAction : undefined)
     }
 
-    const touchedShown = list.slice(0, current.showAllTouched ? TOUCHED_SHOWN_ALL : TOUCHED_SHOWN)
     const query = current.query.trim()
     const found = query ? findFiles(findIndex?.root === current.root ? findIndex.paths : [], query) : []
-    const rows = query ? [] : buildRows(current, lists, ignored)
+    // Files outside this folder have no place in its tree, so they stay in the card.
+    const isTouchedTree = current.touchedOnly && !query
+    const carded = isTouchedTree ? list.filter(touch => !isInside(current.root, touch.path)) : list
+    const touchedHere = list.length - carded.length
+    const touchedShown = carded.slice(0, current.showAllTouched ? TOUCHED_SHOWN_ALL : TOUCHED_SHOWN)
+    const rows = query
+      ? []
+      : isTouchedTree
+        ? buildTouchedRows(current.root, touchOf.keys(), new Set(current.touchedClosed), ignored)
+        : buildRows(current, lists, ignored)
 
     // A very long tree is drawn around the window the person is looking at, with
     // blank room standing in for the rest. A lit row is always drawn so it can be
     // scrolled to.
-    const headerRows = 18 + (list.length ? touchedShown.length + 3 : 0)
+    const headerRows = 18 + (carded.length ? touchedShown.length + 3 : 0)
     const { offset, bodyRows } = e.props.scroll
     const windowFrom = offset - headerRows - bodyRows
     const windowTo = offset - headerRows + bodyRows * 2
@@ -1038,7 +1082,8 @@ export const register: Register = (on, options) => {
         boxKey: keyName,
         pressKey: `show:${keyName}`,
         name,
-        action: 'show',
+        // Beside the touched tree this card holds only files outside it, which cannot be shown there.
+        action: isTouchedTree ? 'mention' : 'show',
         path,
         paddingX: 0,
         gutter: -1,
@@ -1161,28 +1206,53 @@ export const register: Register = (on, options) => {
       </Box>
     )
 
+    const touchedFolders = isTouchedTree ? rows.filter(row => row.isDir) : []
+    const isAllFolded = touchedFolders.length > 0 && touchedFolders.every(row => !row.isOpen)
     const toolbar = (
       <Box key="toolbar" flexDirection="row" flexWrap="wrap" columnGap={2} paddingX={inset} marginTop={1}>
-        <Button key="refresh" hotkey="r" plain label="Refresh" onPress={() => runScan($)} />
-        <Button key="collapse" hotkey="c" plain label="Collapse all" onPress={() => update($, layout, prev => ({ ...prev, expanded: [], autoOpened: {} }))} />
         <Button
-          key="sizes"
-          hotkey="s"
+          key="scope"
+          hotkey="t"
           plain
-          label={current.showSizes ? 'Show dates' : 'Show sizes'}
-          onPress={() => update($, layout, prev => ({ ...prev, showSizes: !prev.showSizes }))}
+          label={current.touchedOnly ? 'All files' : 'Only touched'}
+          onPress={() => update($, layout, prev => ({ ...prev, touchedOnly: !prev.touchedOnly }))}
         />
+        <Button key="refresh" hotkey="r" plain label="Refresh" onPress={() => runScan($)} />
+        <Button
+          key="collapse"
+          hotkey="c"
+          plain
+          label={isAllFolded ? 'Expand all' : 'Collapse all'}
+          onPress={() =>
+            update($, layout, prev =>
+              isTouchedTree
+                ? { ...prev, touchedClosed: isAllFolded ? [] : touchedFolders.map(row => row.path) }
+                : { ...prev, expanded: [], autoOpened: {} },
+            )
+          }
+        />
+        {!isTouchedTree && (
+          <Button
+            key="sizes"
+            hotkey="s"
+            plain
+            label={current.showSizes ? 'Show dates' : 'Show sizes'}
+            onPress={() => update($, layout, prev => ({ ...prev, showSizes: !prev.showSizes }))}
+          />
+        )}
         {!isTopFolder(current.root) && <Button key="up" hotkey="u" plain label="Up a folder" onPress={() => changeRoot($, dirname(current.root))} />}
         {current.root !== current.project && (
           <Button key="back" hotkey="b" plain label="Back to project" onPress={() => changeRoot($, current.project)} />
         )}
-        <Button
-          key="hidden"
-          hotkey="h"
-          plain
-          label={current.showHidden ? 'Hide hidden files' : 'Show hidden files'}
-          onPress={() => update($, layout, prev => ({ ...prev, showHidden: !prev.showHidden }))}
-        />
+        {!isTouchedTree && (
+          <Button
+            key="hidden"
+            hotkey="h"
+            plain
+            label={current.showHidden ? 'Hide hidden files' : 'Show hidden files'}
+            onPress={() => update($, layout, prev => ({ ...prev, showHidden: !prev.showHidden }))}
+          />
+        )}
         <Button key="find-focus" hotkey="f" plain label="Find" onPress={() => $.ui.focus({ requestId: PANE, key: 'find' })} />
       </Box>
     )
@@ -1212,16 +1282,16 @@ export const register: Register = (on, options) => {
       </Box>
     )
 
-    const touchedCard = list.length > 0 && (
+    const touchedCard = carded.length > 0 && (
       <Box key="touched-frame" paddingX={inset} marginTop={1}>
         <Box key="touched" flexDirection="column" flexGrow={1} borderStyle="round" borderDimColor paddingX={1}>
-          {heading('touched-heading', 'CLAUDE TOUCHED', `${list.length} FILE${list.length === 1 ? '' : 'S'}`)}
+          {heading('touched-heading', isTouchedTree ? 'OUTSIDE THIS FOLDER' : 'CLAUDE TOUCHED', `${carded.length} FILE${carded.length === 1 ? '' : 'S'}`)}
           {touchedShown.map(touch => flatRow(`touched:${touch.path}`, touch.path, touch.kind, cardCols))}
-          {list.length > TOUCHED_SHOWN && (
+          {carded.length > TOUCHED_SHOWN && (
             <Button
               key="touched-more"
               plain
-              label={current.showAllTouched ? 'Show fewer' : `Show all ${Math.min(list.length, TOUCHED_SHOWN_ALL)}`}
+              label={current.showAllTouched ? 'Show fewer' : `Show all ${Math.min(carded.length, TOUCHED_SHOWN_ALL)}`}
               onPress={() => update($, layout, prev => ({ ...prev, showAllTouched: !prev.showAllTouched }))}
             />
           )}
@@ -1254,7 +1324,9 @@ export const register: Register = (on, options) => {
         <Box key="tree-heading" flexDirection="column" marginTop={1}>
           <Text dimColor>{'─'.repeat(cols)}</Text>
           <Box paddingX={inset} flexDirection="column">
-            {heading('all-heading', query ? `FOUND ${found.length}` : 'ALL FILES', clip(projectName, Math.floor(contentCols / 2)))}
+            {isTouchedTree
+              ? heading('all-heading', 'CLAUDE TOUCHED', `${touchedHere} FILE${touchedHere === 1 ? '' : 'S'}`)
+              : heading('all-heading', query ? `FOUND ${found.length}` : 'ALL FILES', clip(projectName, Math.floor(contentCols / 2)))}
           </Box>
         </Box>
         {query ? (
@@ -1264,7 +1336,15 @@ export const register: Register = (on, options) => {
           </Box>
         ) : rows.length === 0 ? (
           <Box key="empty" paddingX={inset}>
-            <Text dimColor>{!rootListing ? 'Reading the folder…' : rootListing.entries.length > 0 ? 'Only hidden files here.' : 'This folder is empty.'}</Text>
+            <Text dimColor>
+              {isTouchedTree
+                ? 'Claude has not touched a file in this folder yet.'
+                : !rootListing
+                  ? 'Reading the folder…'
+                  : rootListing.entries.length > 0
+                    ? 'Only hidden files here.'
+                    : 'This folder is empty.'}
+            </Text>
           </Box>
         ) : (
           <Box key="tree" flexDirection="column">

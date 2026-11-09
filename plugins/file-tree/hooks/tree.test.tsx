@@ -12,6 +12,7 @@ import {
   NO_GIT,
   applyTouches,
   buildRows,
+  buildTouchedRows,
   clip,
   commitsSince,
   countLines,
@@ -40,7 +41,9 @@ import {
   shownPath,
   summaryOf,
   visibleFolders,
+  tmuxPlanOf,
   withPinned,
+  withTreeSetting,
 } from './model'
 
 const ROOT = '/work/app'
@@ -51,6 +54,9 @@ const emptyLayout = (over: Partial<Layout> = {}): Layout => ({
   root: ROOT,
   expanded: [],
   autoOpened: {},
+  treeView: 'all',
+  touchedOnly: false,
+  touchedClosed: [],
   query: '',
   showHidden: true,
   showSizes: false,
@@ -58,6 +64,9 @@ const emptyLayout = (over: Partial<Layout> = {}): Layout => ({
   hasAutoOpened: false,
   ...over,
 })
+
+// Most of the panel's behaviour is the whole tree's; the default shows only what Claude touched.
+const ALL_FILES = { options: { treeView: 'all' } }
 
 const idle = (over: Partial<Activity> = {}): Activity => ({
   turn: 1,
@@ -498,6 +507,86 @@ test('images forces pictures, as bytes, where auto would not try', () => {
   expect(imagePlanOf('images', { TERM_PROGRAM: 'WezTerm' })).toEqual(bytes)
 })
 
+test('in herdr, pictures wait for the override the engine needs', () => {
+  const bytes = { via: 'bytes', needsFullscreen: false }
+  const herdr = { TERM_PROGRAM: 'herdr', TERM: 'xterm-256color' }
+  expect(imagePlanOf('auto', herdr)).toBeNull()
+  expect(imagePlanOf('auto', { ...herdr, CLAUDE_CODE_FORCE_TERMINAL_IMAGES: '1' })).toEqual(bytes)
+  expect(imagePlanOf('auto', { ...herdr, CLAUDE_CODE_FORCE_TERMINAL_IMAGES: '0' })).toBeNull()
+  expect(imagePlanOf('chips', { ...herdr, CLAUDE_CODE_FORCE_TERMINAL_IMAGES: '1' })).toBeNull()
+  // Straight in Ghostty the override changes nothing: files still work there.
+  expect(imagePlanOf('auto', { TERM_PROGRAM: 'ghostty', CLAUDE_CODE_FORCE_TERMINAL_IMAGES: '1' })).toEqual({ via: 'file', needsFullscreen: false })
+})
+
+test('in tmux, pictures follow what tmux says it lets through', () => {
+  const bytes = { via: 'bytes', needsFullscreen: false }
+  const env = { TMUX: '/tmp/tmux', TERM_PROGRAM: 'tmux' }
+  expect(imagePlanOf('auto', env, 'ghostty 1.2.0\ton\t1\n')).toEqual(bytes)
+  expect(imagePlanOf('auto', env, 'kitty(0.35.2)\tall\t1\n')).toEqual(bytes)
+  expect(imagePlanOf('auto', env, 'iTerm2 3.5.2\ton\t1\n')).toEqual({ via: 'bytes', needsFullscreen: true })
+  expect(imagePlanOf('auto', env)).toBeNull()
+  expect(imagePlanOf('images', env, 'ghostty 1.2.0\toff\t1\n')).toEqual(bytes)
+  expect(imagePlanOf('images', env, 'iTerm2 3.5.2\ton\t1\n')).toEqual(bytes)
+  expect(imagePlanOf('auto', { ...env, ZELLIJ: '0' }, 'ghostty 1.2.0\ton\t1\n')).toBeNull()
+  expect(imagePlanOf('auto', { ...env, STY: '1.pts' }, 'ghostty 1.2.0\ton\t1\n')).toBeNull()
+  expect(tmuxPlanOf('ghostty 1.2.0\toff\t1\n')).toBeNull()
+  expect(tmuxPlanOf('ghostty 1.2.0\ton\t0\n')).toBeNull()
+  expect(tmuxPlanOf('kitty(0.27.1)\ton\t1\n')).toBeNull()
+  expect(tmuxPlanOf('iTerm2 3.5.2\tall\t1\n')).toBeNull()
+  expect(tmuxPlanOf('iTerm2 3.4.9\ton\t1\n')).toBeNull()
+  expect(tmuxPlanOf('\ton\t1\n')).toBeNull()
+})
+
+test('the touched tree holds only those files, folders first, with lone folders on one row', () => {
+  const paths = [`${ROOT}/README.md`, `${ROOT}/src/lib/deep/b.ts`, `${ROOT}/src/lib/deep/a.ts`, `${ROOT}/docs/x.md`, '/elsewhere/a.ts', `${ROOT}/README.md`]
+  const rows = buildTouchedRows(ROOT, paths, new Set(), new Set())
+  expect(rows.map(row => [row.depth, row.name])).toEqual([
+    [0, 'docs'],
+    [1, 'x.md'],
+    [0, 'src/lib/deep'],
+    [1, 'a.ts'],
+    [1, 'b.ts'],
+    [0, 'README.md'],
+  ])
+  expect(rows[2]).toMatchObject({ path: `${ROOT}/src/lib/deep`, isDir: true, isOpen: true })
+})
+
+test('a folded folder hides its files, and a chain breaks where a second file lands', () => {
+  const deep = `${ROOT}/src/lib/deep`
+  const folded = buildTouchedRows(ROOT, [`${deep}/a.ts`], new Set([deep]), new Set())
+  expect(folded.map(row => [row.name, row.isOpen])).toEqual([['src/lib/deep', false]])
+  const split = buildTouchedRows(ROOT, [`${deep}/a.ts`, `${ROOT}/src/b.ts`], new Set([deep]), new Set())
+  expect(split.map(row => [row.depth, row.name])).toEqual([
+    [0, 'src'],
+    [1, 'lib/deep'],
+    [1, 'b.ts'],
+  ])
+})
+
+test('a file since replaced by a folder of its name draws one row', () => {
+  const rows = buildTouchedRows(ROOT, [`${ROOT}/thing`, `${ROOT}/thing/a.ts`], new Set(), new Set())
+  expect(rows.map(row => [row.name, row.isDir])).toEqual([
+    ['thing', true],
+    ['a.ts', false],
+  ])
+})
+
+test('a changed Tree shows setting sets the view, and an unchanged one leaves it', () => {
+  const chosen = emptyLayout({ treeView: 'touched', touchedOnly: false })
+  expect(withTreeSetting(chosen, 'touched')).toBe(chosen)
+  expect(withTreeSetting(chosen, 'all')).toMatchObject({ treeView: 'all', touchedOnly: false })
+  expect(withTreeSetting(emptyLayout({ treeView: 'all', touchedOnly: false }), 'touched')).toMatchObject({ treeView: 'touched', touchedOnly: true })
+})
+
+test('the touched tree keeps ignored folders marked', () => {
+  const rows = buildTouchedRows(ROOT, [`${ROOT}/dist/app/x.js`, `${ROOT}/a.ts`], new Set(), new Set([`${ROOT}/dist`]))
+  expect(rows.map(row => [row.name, row.isIgnored])).toEqual([
+    ['dist/app', true],
+    ['x.js', true],
+    ['a.ts', false],
+  ])
+})
+
 // The engine, standing in for the machine: one small project on a fake disk.
 
 type Disk = Record<string, { size?: number; mtimeMs?: number } | 'dir'>
@@ -548,13 +637,15 @@ type Standing = {
   where?: { cwd: string }
   fills?: string[]
   toasts?: string[]
+  /** What `tmux display-message` answers. */
+  tmux?: string
 }
 
 // One transparent pixel: the engine reads the header of whatever it is handed.
 const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=='
 
 const stand = (on: On, disk: Disk, git: Git, opens: { count: number; isOpen?: boolean }, standing: Standing = {}) => {
-  const { answer = () => ({ result: {} }), env = {}, icons, png = PNG, where = { cwd: ROOT }, fills = [], toasts = [] } = standing
+  const { answer = () => ({ result: {} }), env = {}, icons, png = PNG, where = { cwd: ROOT }, fills = [], toasts = [], tmux = '' } = standing
   const clock = mock.clock(on, { now: T0 })
   on('command.register', () => ({ value: { command: 'tree' } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
@@ -604,6 +695,7 @@ const stand = (on: On, disk: Disk, git: Git, opens: { count: number; isOpen?: bo
     return { value: icons }
   })
   on('process.run', (_, e) => {
+    if (e.argv[0] === 'tmux') return { value: { exitCode: 0, stdout: tmux, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     const args = e.argv.slice(4)
     const done = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
     git.runs.push(args[0] ?? '')
@@ -683,7 +775,7 @@ test('a read is purple and says read', async ($, on) => {
   await ui.unmount()
 })
 
-test('a denied or failed call leaves no mark', async ($, on) => {
+test('a denied or failed call leaves no mark', ALL_FILES, async ($, on) => {
   const clock = stand(on, DISK, cleanGit(), shown(), { answer: id => (id === 'denied' ? { deny: 'no' } : { result: 'bad', isError: true }) })
   await boot($)
   await clock.advance(400)
@@ -860,11 +952,11 @@ test('without a person watching, nothing is tracked', async ($, on) => {
   await clock.advance(500)
   expect(git.runs).toEqual([])
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(await ui.find({ type: 'Text', text: /CLAUDE TOUCHED/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /^edited$/ })).toBeUndefined()
   await ui.unmount()
 })
 
-test('a command known only to look credits nothing to Claude, and looks at nothing', async ($, on) => {
+test('a command known only to look credits nothing to Claude, and looks at nothing', ALL_FILES, async ($, on) => {
   const disk: Disk = { ...DISK, [`${ROOT}/README.md`]: { size: 90, mtimeMs: T0 + 900 } }
   const git = { ...cleanGit(), status: '## main\0 M README.md\0' }
   const clock = stand(on, disk, git, shown())
@@ -880,7 +972,7 @@ test('a command known only to look credits nothing to Claude, and looks at nothi
 })
 
 
-test('a cd inside the project leaves the tree as it was', async ($, on) => {
+test('a cd inside the project leaves the tree as it was', ALL_FILES, async ($, on) => {
   const where = { cwd: ROOT }
   const clock = stand(on, DISK, cleanGit(), shown(), { where })
   await boot($)
@@ -895,7 +987,7 @@ test('a cd inside the project leaves the tree as it was', async ($, on) => {
   await ui.unmount()
 })
 
-test('moving out of the project moves the tree', async ($, on) => {
+test('moving out of the project moves the tree', ALL_FILES, async ($, on) => {
   const disk: Disk = { ...DISK, '/work/other': 'dir', '/work/other/x.ts': { size: 1, mtimeMs: T0 } }
   const where = { cwd: ROOT }
   const clock = stand(on, disk, cleanGit(), shown(), { where })
@@ -909,7 +1001,7 @@ test('moving out of the project moves the tree', async ($, on) => {
   await ui.unmount()
 })
 
-test('a file clicked after Up a folder is mentioned from the session, not the tree', async ($, on) => {
+test('a file clicked after Up a folder is mentioned from the session, not the tree', ALL_FILES, async ($, on) => {
   const disk: Disk = { ...DISK, '/work': 'dir' }
   const fills: string[] = []
   const clock = stand(on, disk, cleanGit(), shown(), { fills })
@@ -923,7 +1015,7 @@ test('a file clicked after Up a folder is mentioned from the session, not the tr
   await ui.unmount()
 })
 
-test('a hidden-only folder says so when hidden files are off', async ($, on) => {
+test('a hidden-only folder says so when hidden files are off', ALL_FILES, async ($, on) => {
   const disk: Disk = { [ROOT]: 'dir', [`${ROOT}/.env`]: { size: 1, mtimeMs: T0 } }
   const clock = stand(on, disk, cleanGit(), shown())
   await boot($)
@@ -934,7 +1026,7 @@ test('a hidden-only folder says so when hidden files are off', async ($, on) => 
   await ui.unmount()
 })
 
-test('clicking a touched file inside an ignored folder still finds it', async ($, on) => {
+test('clicking a touched file inside an ignored folder still finds it', ALL_FILES, async ($, on) => {
   const disk: Disk = { ...DISK, [`${ROOT}/dist`]: 'dir', [`${ROOT}/dist/x.js`]: { size: 1, mtimeMs: T0 } }
   const git = { ...cleanGit(), status: '## main\0!! dist/\0' }
   const clock = stand(on, disk, git, shown())
@@ -949,7 +1041,7 @@ test('clicking a touched file inside an ignored folder still finds it', async ($
   await ui.unmount()
 })
 
-test('clicking a touched file outside the tree says why nothing moved', async ($, on) => {
+test('clicking a touched file outside the tree says why nothing moved', ALL_FILES, async ($, on) => {
   const disk: Disk = { ...DISK, '/elsewhere': 'dir', '/elsewhere/a.ts': { size: 1, mtimeMs: T0 } }
   const toasts: string[] = []
   const clock = stand(on, disk, cleanGit(), shown(), { toasts })
@@ -963,7 +1055,7 @@ test('clicking a touched file outside the tree says why nothing moved', async ($
   await ui.unmount()
 })
 
-test('a folder opened for a read closes by itself, but not under someone using the panel', async ($, on) => {
+test('a folder opened for a read closes by itself, but not under someone using the panel', ALL_FILES, async ($, on) => {
   const clock = stand(on, DISK, cleanGit(), shown())
   await boot($)
   await clock.advance(400)
@@ -992,7 +1084,7 @@ test('the totals say when they are only a floor', async ($, on) => {
   await ui.unmount()
 })
 
-test('on Ghostty the rows draw picture icons, and an opened folder changes its own', async ($, on) => {
+test('on Ghostty the rows draw picture icons, and an opened folder changes its own', ALL_FILES, async ($, on) => {
   const clock = stand(on, DISK, cleanGit(), shown(), { env: { TERM_PROGRAM: 'ghostty' }, icons: ICONS })
   await boot($)
   await clock.advance(400)
@@ -1008,7 +1100,7 @@ test('on Ghostty the rows draw picture icons, and an opened folder changes its o
   await ui.unmount()
 })
 
-test('where only bytes can reach the terminal, the picture carries them', async ($, on) => {
+test('where only bytes can reach the terminal, the picture carries them', ALL_FILES, async ($, on) => {
   const env = { TERM_PROGRAM: 'iTerm.app', TERM_PROGRAM_VERSION: '3.5.2' }
   const clock = stand(on, DISK, cleanGit(), shown(), { env, icons: ICONS })
   await boot($)
@@ -1018,7 +1110,7 @@ test('where only bytes can reach the terminal, the picture carries them', async 
   await ui.unmount()
 })
 
-test('a damaged icon file costs only its row, which keeps a chip', async ($, on) => {
+test('a damaged icon file costs only its row, which keeps a chip', ALL_FILES, async ($, on) => {
   const env = { TERM_PROGRAM: 'iTerm.app', TERM_PROGRAM_VERSION: '3.5.2' }
   const clock = stand(on, DISK, cleanGit(), shown(), { env, icons: ICONS, png: 'bm90IGEgcG5n' })
   await boot($)
@@ -1029,7 +1121,7 @@ test('a damaged icon file costs only its row, which keeps a chip', async ($, on)
   await ui.unmount()
 })
 
-test('without a capable terminal, or without the icon map, rows keep their chips', async ($, on) => {
+test('without a capable terminal, or without the icon map, rows keep their chips', ALL_FILES, async ($, on) => {
   const clock = stand(on, DISK, cleanGit(), shown(), { env: { TERM_PROGRAM: 'Apple_Terminal' }, icons: ICONS })
   await boot($)
   await clock.advance(400)
@@ -1039,7 +1131,7 @@ test('without a capable terminal, or without the icon map, rows keep their chips
   await ui.unmount()
 })
 
-test('an icon map that cannot be read leaves the chips', async ($, on) => {
+test('an icon map that cannot be read leaves the chips', ALL_FILES, async ($, on) => {
   const clock = stand(on, DISK, cleanGit(), shown(), { env: { TERM_PROGRAM: 'ghostty' } })
   await boot($)
   await clock.advance(400)
@@ -1057,13 +1149,17 @@ test('the pane draws on every surface', async ($, on) => {
   await clock.advance(400)
   for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await ui.find({ type: 'Text', text: /CLAUDE TOUCHED/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^edited$/ })).toBeDefined()
+    await ui.press({ key: 'scope' })
     expect(await ui.find({ type: 'Text', text: /ALL FILES/ })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /^edited$/ })).toBeDefined()
+    await ui.press({ key: 'scope' })
     await ui.unmount()
   }
 })
 
-test('pressing a folder opens it, and Collapse all closes it', async ($, on) => {
+test('pressing a folder opens it, and Collapse all closes it', ALL_FILES, async ($, on) => {
   const clock = stand(on, DISK, cleanGit(), shown())
   await boot($)
   await clock.advance(400)
@@ -1078,7 +1174,7 @@ test('pressing a folder opens it, and Collapse all closes it', async ($, on) => 
   await ui.unmount()
 })
 
-test("a click lands on the row's click area, and no Button holds its name on the terminal", async ($, on) => {
+test("a click lands on the row's click area, and no Button holds its name on the terminal", ALL_FILES, async ($, on) => {
   const clock = stand(on, DISK, cleanGit(), shown())
   await boot($)
   await clock.advance(400)
@@ -1100,7 +1196,7 @@ test("a click lands on the row's click area, and no Button holds its name on the
   await desktop.unmount()
 })
 
-test('the toolbar hides dotfiles and offers the way back', async ($, on) => {
+test('the toolbar hides dotfiles and offers the way back', ALL_FILES, async ($, on) => {
   const disk: Disk = { ...DISK, [`${ROOT}/.env`]: { size: 1, mtimeMs: T0 }, '/work': 'dir' }
   const clock = stand(on, disk, cleanGit(), shown())
   await boot($)
@@ -1184,7 +1280,7 @@ test('having used /tree, the panel no longer opens by itself', async ($, on) => 
   expect(opens.count).toBe(1)
 })
 
-test('the first edit leaves a panel that is already open alone, even above the prompt', async ($, on) => {
+test('the first edit leaves a panel that is already open alone, even above the prompt', ALL_FILES, async ($, on) => {
   const opens = shown()
   const clock = stand(on, DISK, cleanGit(), opens)
   await boot($)
@@ -1199,7 +1295,7 @@ test('the first edit leaves a panel that is already open alone, even above the p
   await ui.unmount()
 })
 
-test('a lit row outside the window is still drawn', async ($, on) => {
+test('a lit row outside the window is still drawn', ALL_FILES, async ($, on) => {
   const disk: Disk = { ...DISK }
   for (let i = 0; i < 300; i++) disk[`${ROOT}/file${String(i).padStart(3, '0')}.ts`] = { size: 1, mtimeMs: T0 }
   const clock = stand(on, disk, cleanGit(), shown())
@@ -1212,5 +1308,187 @@ test('a lit row outside the window is still drawn', async ($, on) => {
   expect(await ui.find({ type: 'Button', key: `open:${ROOT}/file250.ts` } as never)).toBeDefined()
   expect(await ui.find({ type: 'Button', key: `open:${ROOT}/file200.ts` } as never)).toBeUndefined()
   expect(await ui.find({ type: 'Button', key: `open:${ROOT}/file001.ts` } as never)).toBeDefined()
+  await ui.unmount()
+})
+
+test('by default the tree holds only what Claude touched, and the toggle shows the rest', async ($, on) => {
+  const disk: Disk = { ...DISK, [`${ROOT}/other.ts`]: { size: 1, mtimeMs: T0 } }
+  const clock = stand(on, disk, cleanGit(), shown())
+  await boot($)
+  await clock.advance(400)
+  await callTool($, 'Edit', { file_path: `${ROOT}/README.md` }, 'a')
+  await callTool($, 'Read', { file_path: `${ROOT}/src/client.js` }, 'b')
+  await clock.advance(400)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const other = { type: 'Button', key: `open:${ROOT}/other.ts` } as never
+  expect(await ui.find({ type: 'Button', key: `open:${ROOT}/README.md` } as never)).toBeDefined()
+  expect(await ui.find({ type: 'Button', key: `open:${ROOT}/src/client.js` } as never)).toBeDefined()
+  expect(await ui.find(other)).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /2 FILES/ })).toBeDefined()
+  expect(await ui.find({ type: 'Button', key: `show:touched:${ROOT}/README.md` } as never)).toBeUndefined()
+
+  await ui.press({ key: 'scope' })
+  expect(await ui.find(other)).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /ALL FILES/ })).toBeDefined()
+  await ui.press({ key: 'scope' })
+  expect(await ui.find(other)).toBeUndefined()
+  await ui.unmount()
+})
+
+test('with nothing touched, the tree says so', async ($, on) => {
+  const clock = stand(on, DISK, cleanGit(), shown())
+  await boot($)
+  await clock.advance(400)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /has not touched a file/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a touched folder folds by hand, and Expand all opens it', async ($, on) => {
+  const clock = stand(on, DISK, cleanGit(), shown())
+  await boot($)
+  await clock.advance(400)
+  await callTool($, 'Read', { file_path: `${ROOT}/src/client.js` })
+  await clock.advance(400)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const inside = { type: 'Button', key: `open:${ROOT}/src/client.js` } as never
+
+  await ui.press({ key: `open:${ROOT}/src` })
+  expect(await ui.find(inside)).toBeUndefined()
+  await ui.press({ key: 'collapse' })
+  expect(await ui.find(inside)).toBeDefined()
+  await ui.press({ key: 'collapse' })
+  expect(await ui.find(inside)).toBeUndefined()
+  await ui.unmount()
+})
+
+test('a folder folded by hand does not reopen by itself', async ($, on) => {
+  const clock = stand(on, DISK, cleanGit(), shown())
+  await boot($)
+  await clock.advance(400)
+  await callTool($, 'Read', { file_path: `${ROOT}/src/client.js` })
+  await clock.advance(400)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: `open:${ROOT}/src` })
+  await callTool($, 'Edit', { file_path: `${ROOT}/src/client.js` }, 'again')
+  await clock.advance(400)
+  expect(await ui.find({ type: 'Button', key: `open:${ROOT}/src/client.js` } as never)).toBeUndefined()
+  await ui.unmount()
+})
+
+test('a file touched outside this folder stays in a card of its own', async ($, on) => {
+  const disk: Disk = { ...DISK, '/elsewhere': 'dir', '/elsewhere/a.ts': { size: 1, mtimeMs: T0 } }
+  const fills: string[] = []
+  const clock = stand(on, disk, cleanGit(), shown(), { fills })
+  await boot($)
+  await clock.advance(400)
+  await callTool($, 'Read', { file_path: '/elsewhere/a.ts' }, 'a')
+  await callTool($, 'Read', { file_path: `${ROOT}/README.md` }, 'b')
+  await clock.advance(400)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /OUTSIDE THIS FOLDER/ })).toBeDefined()
+  expect(await ui.find({ type: 'Button', key: 'show:touched:/elsewhere/a.ts' } as never)).toBeDefined()
+  expect(await ui.find({ type: 'Button', key: `show:touched:${ROOT}/README.md` } as never)).toBeUndefined()
+  await ui.press({ key: 'show:touched:/elsewhere/a.ts' })
+  expect(fills).toEqual(['@/elsewhere/a.ts '])
+  await ui.unmount()
+})
+
+test('finding a touched file stays in the touched tree and unfolds it', async ($, on) => {
+  const clock = stand(on, DISK, cleanGit(), shown())
+  await boot($)
+  await clock.advance(400)
+  await callTool($, 'Read', { file_path: `${ROOT}/src/client.js` })
+  await clock.advance(400)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: `open:${ROOT}/src` })
+  await ui.input({ key: 'find', text: 'client', kind: 'change' })
+  await ui.input({ key: 'find', text: 'client', kind: 'submit' })
+  expect(await ui.find({ type: 'Text', text: /ALL FILES/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', key: `open:${ROOT}/src/client.js` } as never)).toBeDefined()
+  await ui.unmount()
+})
+
+test('in herdr with the override the rows draw pictures, and without it they keep chips', ALL_FILES, async ($, on) => {
+  const env: Record<string, string> = { TERM_PROGRAM: 'herdr', TERM: 'xterm-256color', CLAUDE_CODE_FORCE_TERMINAL_IMAGES: '1' }
+  const clock = stand(on, DISK, cleanGit(), shown(), { env, icons: ICONS })
+  await boot($)
+  await clock.advance(400)
+  const pictured = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await pictured.find({ type: 'Image' }))?.props.source).toEqual({ png: PNG })
+  await pictured.unmount()
+
+  delete env.CLAUDE_CODE_FORCE_TERMINAL_IMAGES
+  await boot($)
+  await clock.advance(400)
+  const chipped = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await chipped.find({ type: 'Image' })).toBeUndefined()
+  await chipped.unmount()
+})
+
+test('in tmux the panel asks tmux, and draws pictures only if tmux lets them through', ALL_FILES, async ($, on) => {
+  const env = { TERM_PROGRAM: 'tmux', TMUX: '/tmp/tmux', TMUX_PANE: '%1' }
+  const clock = stand(on, DISK, cleanGit(), shown(), { env, icons: ICONS, tmux: 'ghostty 1.2.0\ton\t1\n' })
+  await boot($)
+  await clock.advance(400)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Image' }))?.props.source).toEqual({ png: PNG })
+  await ui.unmount()
+})
+
+test('a file joins the touched tree only once its tool has run', async ($, on) => {
+  let release = (): void => undefined
+  const held = new Promise<void>(resolve => {
+    release = resolve
+  })
+  const clock = stand(on, DISK, cleanGit(), shown(), { answer: () => held.then(() => ({ result: {} })) })
+  await boot($)
+  await clock.advance(400)
+  const running = callTool($, 'Read', { file_path: `${ROOT}/README.md` })
+  await clock.advance(1)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const row = { type: 'Button', key: `open:${ROOT}/README.md` } as never
+  expect(await ui.find(row)).toBeUndefined()
+  release()
+  await running
+  await clock.advance(400)
+  expect(await ui.find(row)).toBeDefined()
+  await ui.unmount()
+})
+
+test('a denied call leaves no row in the touched tree', async ($, on) => {
+  const clock = stand(on, DISK, cleanGit(), shown(), { answer: () => ({ deny: 'no' }) })
+  await boot($)
+  await clock.advance(400)
+  await callTool($, 'Edit', { file_path: `${ROOT}/README.md` })
+  await clock.advance(400)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Button', key: `open:${ROOT}/README.md` } as never)).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /has not touched a file/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('with one folder folded, c folds the rest, and only then expands them all', async ($, on) => {
+  const disk: Disk = { ...DISK, [`${ROOT}/lib`]: 'dir', [`${ROOT}/lib/x.ts`]: { size: 1, mtimeMs: T0 } }
+  const clock = stand(on, disk, cleanGit(), shown())
+  await boot($)
+  await clock.advance(400)
+  await callTool($, 'Read', { file_path: `${ROOT}/src/client.js` }, 'a')
+  await callTool($, 'Read', { file_path: `${ROOT}/lib/x.ts` }, 'b')
+  await clock.advance(400)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const client = { type: 'Button', key: `open:${ROOT}/src/client.js` } as never
+  const lib = { type: 'Button', key: `open:${ROOT}/lib/x.ts` } as never
+
+  await ui.press({ key: `open:${ROOT}/src` })
+  expect(await ui.find(client)).toBeUndefined()
+  expect(await ui.find(lib)).toBeDefined()
+  await ui.press({ key: 'collapse' })
+  expect(await ui.find(client)).toBeUndefined()
+  expect(await ui.find(lib)).toBeUndefined()
+  await ui.press({ key: 'collapse' })
+  expect(await ui.find(client)).toBeDefined()
+  expect(await ui.find(lib)).toBeDefined()
   await ui.unmount()
 })

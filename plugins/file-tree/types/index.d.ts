@@ -1,5 +1,7 @@
 export type TouchKind = 'read' | 'edited' | 'committed'
 
+export type TreeView = 'touched' | 'all'
+
 /** One file Claude has handled this session. */
 export type Touch = {
   path: string
@@ -65,6 +67,12 @@ export type Layout = {
   expanded: string[]
   /** Folders opened to show Claude's work, with when: these close themselves. */
   autoOpened: Record<string, number>
+  /** The `Tree shows` setting the view was last taken from. */
+  treeView: TreeView
+  /** Whether the tree holds only the files Claude has handled. */
+  touchedOnly: boolean
+  /** Folders folded by hand in that tree: any other stands open. */
+  touchedClosed: string[]
   query: string
   showHidden: boolean
   showSizes: boolean

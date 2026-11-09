@@ -1,6 +1,6 @@
 // Everything here is pure: what a tool call touches, what git says, which rows to draw.
 
-import type { Activity, Change, Entry, GitView, Layout, Listing, Touch, TouchKind } from '../types'
+import type { Activity, Change, Entry, GitView, Layout, Listing, Touch, TouchKind, TreeView } from '../types'
 
 export const MAX_CHANGES = 3000
 export const MAX_ENTRIES = 400
@@ -639,6 +639,80 @@ export const buildRows = (
   return rows
 }
 
+type TouchedFolder = { folders: Map<string, TouchedFolder>; files: string[] }
+
+/**
+ * The tree cut down to these files, so a long session still fits on a screen.
+ * Folders stand open unless folded by hand, and one holding nothing but a single
+ * folder shares that folder's row. Files outside `root` have no place here.
+ */
+export const buildTouchedRows = (
+  root: string,
+  paths: Iterable<string>,
+  folded: ReadonlySet<string>,
+  ignored: ReadonlySet<string>,
+): TreeRow[] => {
+  const top: TouchedFolder = { folders: new Map(), files: [] }
+  for (const path of new Set(paths)) {
+    if (path === root || !isInside(root, path)) continue
+    const parts = shownPath(root, path).split('/')
+    const file = parts.pop() ?? ''
+    let folder = top
+    for (const part of parts) {
+      let next = folder.folders.get(part)
+      if (!next) {
+        next = { folders: new Map(), files: [] }
+        folder.folders.set(part, next)
+      }
+      folder = next
+    }
+    folder.files.push(file)
+  }
+
+  const rowOf = (path: string, name: string, depth: number, isDir: boolean, isOpen: boolean, isIgnored: boolean): TreeRow => ({
+    path,
+    name,
+    depth,
+    isDir,
+    isOpen,
+    isIgnored,
+    isLink: false,
+    isHidden: name.startsWith('.'),
+    size: 0,
+    mtimeMs: 0,
+    more: 0,
+  })
+
+  const rows: TreeRow[] = []
+  const walk = (folder: TouchedFolder, dir: string, depth: number, isParentIgnored: boolean): void => {
+    for (const [name, child] of [...folder.folders].sort(([a], [b]) => collator.compare(a, b))) {
+      let shown = name
+      let path = join(dir, name)
+      let inner = child
+      let isIgnored = isParentIgnored || ignored.has(path)
+      while (inner.files.length === 0 && inner.folders.size === 1 && !folded.has(path)) {
+        const [only] = inner.folders
+        if (!only) break
+        shown = `${shown}/${only[0]}`
+        path = join(path, only[0])
+        inner = only[1]
+        isIgnored ||= ignored.has(path)
+      }
+      const isOpen = !folded.has(path)
+      rows.push(rowOf(path, shown, depth, true, isOpen, isIgnored))
+      if (isOpen) walk(inner, path, depth + 1, isIgnored)
+    }
+    for (const name of [...folder.files].sort(collator.compare)) {
+      // A file since replaced by a folder of that name: the folder's row stands for it.
+      if (folder.folders.has(name)) continue
+      const path = join(dir, name)
+      rows.push(rowOf(path, name, depth, false, false, isParentIgnored || ignored.has(path)))
+    }
+  }
+  walk(top, root, 0, false)
+  return rows
+}
+
 export type FolderMark = TouchKind | 'changed'
 
 const MARK_RANK: Record<FolderMark, number> = { read: 1, changed: 2, committed: 3, edited: 4 }
@@ -676,6 +750,10 @@ export const foldersToOpen = (layout: Layout, paths: readonly string[], ignored:
   }
   return [...opening]
 }
+
+/** A changed setting decides the view; an unchanged one leaves the person's own choice alone. */
+export const withTreeSetting = (layout: Layout, treeView: TreeView): Layout =>
+  layout.treeView === treeView ? layout : { ...layout, treeView, touchedOnly: treeView === 'touched' }
 
 /** The person is using this file or folder: what holds it stops closing by itself. */
 export const withPinned = (layout: Layout, path: string): Layout => ({
@@ -785,10 +863,38 @@ export type ImagePlan = {
   needsFullscreen: boolean
 }
 
+/** What tmux is asked, for `tmuxPlanOf` to read. */
+export const TMUX_IMAGE_QUESTION = '#{client_termtype}\t#{allow-passthrough}\t#{focus-events}'
+
+const isAtLeast = (version: RegExpExecArray, major: number, minor: number): boolean => {
+  const [, first = '0', second = '0'] = version
+  return Number(first) > major || (Number(first) === major && Number(second) >= minor)
+}
+
+/** Reads tmux's answer on the terms the engine draws pictures there. */
+export const tmuxPlanOf = (answer: string): ImagePlan | null => {
+  const [termtype = '', passthrough = '', focusEvents = ''] = answer.replace(/\r?\n$/, '').split('\t')
+  const isOn = passthrough === 'on' || passthrough === '1'
+  if ((!isOn && passthrough !== 'all') || focusEvents !== '1') return null
+  const kitty = /^kitty\((\d+)\.(\d+)/.exec(termtype)
+  if (/^(ghostty|kitty)( |$)/.test(termtype) || (kitty && isAtLeast(kitty, 0, 28))) return { via: 'bytes', needsFullscreen: false }
+  const iterm = /^iTerm2\s+(\d+)\.(\d+)/.exec(termtype)
+  return isOn && iterm && isAtLeast(iterm, 3, 5) ? { via: 'bytes', needsFullscreen: true } : null
+}
+
 /** Whether this terminal can draw pictures, and how. Null means the chips. */
-export const imagePlanOf = (setting: unknown, env: Readonly<Record<string, string | undefined>>): ImagePlan | null => {
+export const imagePlanOf = (
+  setting: unknown,
+  env: Readonly<Record<string, string | undefined>>,
+  tmuxAnswer?: string,
+): ImagePlan | null => {
   if (setting === 'chips') return null
-  const forced: ImagePlan | null = setting === 'images' ? { via: 'bytes', needsFullscreen: false } : null
+  // herdr lands on this too: it answers the engine as `libghostty`, which the engine
+  // does not count as able to draw, so pictures there wait for the engine's own override.
+  const isForced = setting === 'images' || /^(1|true|yes|on)$/i.test(env.CLAUDE_CODE_FORCE_TERMINAL_IMAGES ?? '')
+  const forced: ImagePlan | null = isForced ? { via: 'bytes', needsFullscreen: false } : null
+  // Told to try regardless, tmux's answer has no say; and it cannot speak for a multiplexer around it.
+  if (!forced && env.TMUX && !env.ZELLIJ && !env.STY && tmuxAnswer !== undefined) return tmuxPlanOf(tmuxAnswer)
   // Between here and the terminal, only bytes can pass, and only if it was set up to let them.
   if (env.SSH_CONNECTION || env.SSH_TTY || env.TMUX || env.ZELLIJ || env.STY) return forced
 
