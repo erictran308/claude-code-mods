@@ -7,6 +7,7 @@ Mods for [Claude Code](https://code.claude.com): small plugins that change its i
 | Mod | What it does |
 |---|---|
 | [crew-progress](plugins/crew-progress) | Progress bar above the prompt and a live panel of subagents. Works in any session, with no setup. |
+| [file-tree](plugins/file-tree) | A live file tree beside the chat that lights up the files Claude reads, edits and commits. |
 
 ![crew-progress: the progress bar above the prompt and the Crew panel beside it](plugins/crew-progress/assets/demo.png)
 
@@ -52,6 +53,8 @@ To add a mod:
 To release a change, raise `version` in both `plugin.json` and `marketplace.json`, then run `scripts/check.sh`.
 
 `scripts/check.sh` needs `claude` and `jq`.
+
+`scripts/build-file-tree-icons.mjs` rebuilds the picture icons of `file-tree` from Material Icon Theme. It needs `node` and `magick`, and its first lines say how to run it.
 
 ## License
 

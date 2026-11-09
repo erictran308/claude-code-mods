@@ -9,6 +9,13 @@
       "description": "Progress bar above the prompt and a live panel of subagents. Works in any session, with no setup.",
       "version": "0.1.0",
       "category": "mod"
+    },
+    {
+      "name": "file-tree",
+      "source": "./plugins/file-tree",
+      "description": "A live file tree beside the chat that lights up the files Claude reads, edits and commits.",
+      "version": "0.1.0",
+      "category": "mod"
     }
   ]
 }

@@ -1,0 +1,33 @@
+{
+  "name": "file-tree",
+  "version": "0.1.0",
+  "description": "A live file tree beside the chat (/tree) that lights up the files Claude reads, edits and commits. Git status, line counts and find included.",
+  "author": { "name": "Eric Tran", "url": "https://github.com/erictran308" },
+  "homepage": "https://github.com/erictran308/claude-code-mods/tree/main/plugins/file-tree",
+  "repository": "https://github.com/erictran308/claude-code-mods",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "autoOpen": {
+      "type": "string",
+      "title": "Open the file tree",
+      "description": "first-edit: once per session, when Claude first edits a file. never: only with /tree.",
+      "default": "first-edit",
+      "options": ["first-edit", "never"]
+    },
+    "icons": {
+      "type": "string",
+      "title": "File icons",
+      "description": "auto: full-color picture icons where the terminal can draw them (Ghostty, kitty, iTerm2 3.5 or later), chips elsewhere. images: always try pictures, for tmux with passthrough or ssh. chips: never use pictures.",
+      "default": "auto",
+      "options": ["auto", "images", "chips"]
+    },
+    "glyphs": {
+      "type": "string",
+      "title": "Terminal icons",
+      "description": "nerd: rounded chips and folder icons, needs a Nerd Font in your terminal. plain: standard Unicode only.",
+      "default": "nerd",
+      "options": ["nerd", "plain"]
+    }
+  },
+  "license": "MIT"
+}

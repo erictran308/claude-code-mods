@@ -1,0 +1,1216 @@
+import type { On } from 'claude-code'
+import { expect, mock, test } from 'claude-code/testing'
+import type { Engine } from 'claude-code/testing'
+
+import type { Activity, GitView, Layout, Listing, Touch } from '../types'
+import { GLYPHS, chipOf } from './art'
+import {
+  AUTO_CLOSE_MS,
+  FLASH_MS,
+  MAX_ATTRIBUTED,
+  MAX_CHANGES,
+  NO_GIT,
+  applyTouches,
+  buildRows,
+  clip,
+  commitsSince,
+  countLines,
+  dirname,
+  findFiles,
+  foldersToClose,
+  foldersToOpen,
+  formatSize,
+  iconOf,
+  imagePlanOf,
+  isTopFolder,
+  listingOf,
+  mentionPath,
+  parseIconMap,
+  parseNumstat,
+  parseReflog,
+  parseStatus,
+  pathMapper,
+  pickChanged,
+  planOfTool,
+  resolvePath,
+  sameGitView,
+  sameListing,
+  shellMayWrite,
+  shellReads,
+  shownPath,
+  summaryOf,
+  visibleFolders,
+  withPinned,
+} from './model'
+
+const ROOT = '/work/app'
+const T0 = Date.parse('2026-11-09T10:00:00Z')
+
+const emptyLayout = (over: Partial<Layout> = {}): Layout => ({
+  project: ROOT,
+  root: ROOT,
+  expanded: [],
+  autoOpened: {},
+  query: '',
+  showHidden: true,
+  showSizes: false,
+  showAllTouched: false,
+  hasAutoOpened: false,
+  ...over,
+})
+
+const idle = (over: Partial<Activity> = {}): Activity => ({
+  turn: 1,
+  isWorking: false,
+  working: [],
+  trail: [],
+  trailTurn: 1,
+  commitSha: '',
+  ...over,
+})
+
+const touch = (path: string, kind: Touch['kind'], over: Partial<Touch> = {}): Touch => ({
+  path,
+  kind,
+  lastAction: kind,
+  turnAction: kind,
+  lastAt: T0,
+  turn: 1,
+  liveUntil: 0,
+  ...over,
+})
+
+test('paths resolve against the working folder and home', () => {
+  expect(resolvePath(ROOT, 'src/a.ts')).toBe('/work/app/src/a.ts')
+  expect(resolvePath(ROOT, '../other/./b.ts')).toBe('/work/other/b.ts')
+  expect(resolvePath(ROOT, '/etc/hosts')).toBe('/etc/hosts')
+  expect(resolvePath(ROOT, '~/notes.md', '/home/me')).toBe('/home/me/notes.md')
+  expect(shownPath(ROOT, '/work/app/src/a.ts')).toBe('src/a.ts')
+  expect(shownPath(ROOT, '/home/me/x', '/home/me')).toBe('~/x')
+})
+
+test('built-in tools name their files', () => {
+  expect(planOfTool('Read', { file_path: 'a.ts' }, ROOT)).toEqual({ reads: ['/work/app/a.ts'], writes: [], mayWrite: false })
+  expect(planOfTool('Edit', { file_path: '/x/a.ts' }, ROOT).writes).toEqual(['/x/a.ts'])
+  expect(planOfTool('NotebookEdit', { notebook_path: 'n.ipynb' }, ROOT).writes).toEqual(['/work/app/n.ipynb'])
+  expect(planOfTool('Grep', { pattern: 'x' }, ROOT)).toEqual({ reads: [], writes: [], mayWrite: false })
+})
+
+test('MCP tools are read by what they are called and what they name', () => {
+  expect(planOfTool('mcp__fw__read', { paths: ['a.ts', 'b.ts'] }, ROOT).reads).toEqual(['/work/app/a.ts', '/work/app/b.ts'])
+  expect(planOfTool('mcp__fw__search', { pattern: 'x', path: 'src' }, ROOT).reads).toEqual([])
+  expect(planOfTool('mcp__fs__write_file', { path: 'c.ts' }, ROOT)).toEqual({ reads: [], writes: ['/work/app/c.ts'], mayWrite: true })
+  expect(planOfTool('mcp__notion__update_page', { page_id: '1' }, ROOT)).toEqual({ reads: [], writes: [], mayWrite: false })
+})
+
+test("fastwrite's script names the files it edits, moves and removes", () => {
+  const script = '@ src/a.ts\ns/old/new/\n> src/new.ts\nbody\n.\nmv src/old.ts src/moved.ts\nrm src/gone.ts\n>> 12的 14一\n'
+  expect(planOfTool('mcp__fw__edit', { script }, ROOT).writes).toEqual([
+    '/work/app/src/a.ts',
+    '/work/app/src/new.ts',
+    '/work/app/src/moved.ts',
+    '/work/app/src/gone.ts',
+  ])
+})
+
+test('a dry run changes nothing, so it marks nothing', () => {
+  const plan = { reads: [], writes: [], mayWrite: false }
+  expect(planOfTool('mcp__fw__edit', { script: '@ a.ts\n', dry_run: true }, ROOT)).toEqual(plan)
+  expect(planOfTool('mcp__fs__edit_file', { path: 'a.ts', dryRun: true }, ROOT)).toEqual(plan)
+})
+
+test('a write that also says find is a write, and paths go by many names', () => {
+  expect(planOfTool('mcp__fs__find_and_replace', { path: 'a.ts' }, ROOT).writes).toEqual(['/work/app/a.ts'])
+  expect(planOfTool('mcp__fs__search_replace', { relative_path: 'b.ts' }, ROOT).writes).toEqual(['/work/app/b.ts'])
+  expect(planOfTool('mcp__fs__move_file', { source: 'a/old.ts', destination: 'a/new.ts' }, ROOT).writes).toEqual([
+    '/work/app/a/old.ts',
+    '/work/app/a/new.ts',
+  ])
+})
+
+test('loose words such as from and to must look like paths', () => {
+  expect(planOfTool('mcp__cal__create_event', { from: '2026-11-09', to: 'me@x.com' }, ROOT).writes).toEqual([])
+  expect(planOfTool('mcp__web__update', { target: 'https://x.com/a/b' }, ROOT).writes).toEqual([])
+})
+
+test('a shell command reads the files it plainly reads', () => {
+  expect(shellReads('cat a.ts && cd sub && head -n 5 b.txt | wc -l', ROOT)).toEqual(['/work/app/a.ts', '/work/app/sub/b.txt'])
+  expect(shellReads('cat a.ts > copy.ts', ROOT)).toEqual(['/work/app/a.ts'])
+  expect(shellReads("sed -n '1,2p' c.ts", ROOT)).toEqual(['/work/app/c.ts'])
+  expect(shellReads("sed -i 's/a/b/' c.ts", ROOT)).toEqual([])
+  expect(shellReads('fw read d.ts -l 1-5', ROOT)).toEqual(['/work/app/d.ts'])
+  expect(shellReads('rg foo src && cat *.ts', ROOT)).toEqual([])
+  expect(shellReads('cat "with space.ts"', ROOT)).toEqual(['/work/app/with space.ts'])
+})
+
+test('a heredoc is text, a subshell is commands, and in-place sed is no read', () => {
+  expect(shellReads("python3 - <<'EOF'\ncat README.md\nEOF\ncat real.ts", ROOT)).toEqual(['/work/app/real.ts'])
+  expect(shellReads('(cd sub && cat a.ts)', ROOT)).toEqual(['/work/app/sub/a.ts'])
+  expect(shellReads("if cat a.ts; then head b.ts; fi", ROOT)).toEqual(['/work/app/a.ts', '/work/app/b.ts'])
+  expect(shellReads("sed -Ei 's/a/b/' f.ts", ROOT)).toEqual([])
+  expect(shellReads("sed --in-place 's/a/b/' f.ts", ROOT)).toEqual([])
+  expect(shellReads("FOO=1 cat a.ts", ROOT)).toEqual(['/work/app/a.ts'])
+})
+
+test('a shell command known only to look cannot have written anything', () => {
+  for (const command of [
+    'ls -la',
+    'sleep 60',
+    'git status --short',
+    'git -C sub log -3',
+    'cat a 2>/dev/null',
+    'rg foo src 2>&1 | head -5',
+    "sed -n '1,2p' a",
+    'find . -name x',
+    'fw read a.ts',
+    'if test -f a; then echo yes; fi',
+  ]) {
+    expect([command, shellMayWrite(command)]).toEqual([command, false])
+  }
+})
+
+test('anything else may have', () => {
+  for (const command of [
+    'python3 fix.py',
+    'git commit -am x',
+    'git -C sub checkout main',
+    'echo hi > a.txt',
+    'cat a >> b',
+    "sed -i 's/a/b/' f",
+    'find . -delete',
+    "fw apply <<'EOF'\n@ a.ts\nEOF",
+    'ls && make',
+    'FOO=1 npm run build',
+  ]) {
+    expect([command, shellMayWrite(command)]).toEqual([command, true])
+  }
+})
+
+test('a Bash call plans a look at the folder only if it may have written', () => {
+  expect(planOfTool('Bash', { command: 'ls' }, ROOT).mayWrite).toBe(false)
+  expect(planOfTool('Bash', { command: 'make' }, ROOT).mayWrite).toBe(true)
+})
+
+test('reading a changed file leaves it changed, and changing a committed one reopens it', () => {
+  let list = applyTouches([], ['/a'], 'edited', T0, 1)
+  list = applyTouches(list, ['/a'], 'read', T0 + 1, 1)
+  expect(list[0]).toMatchObject({ kind: 'edited', lastAction: 'read', liveUntil: T0 + 1 + FLASH_MS })
+
+  list = applyTouches(list, ['/a'], 'committed', T0 + 2, 1)
+  expect(list[0]?.kind).toBe('committed')
+  expect(applyTouches(list, ['/a'], 'read', T0 + 3, 1)[0]?.kind).toBe('committed')
+  expect(applyTouches(list, ['/a'], 'edited', T0 + 3, 1)[0]?.kind).toBe('edited')
+})
+
+test('a later turn that only reads an edited file is a turn that read it', () => {
+  const edited = applyTouches([], ['/a'], 'edited', T0, 1)
+  expect(summaryOf(edited, idle())).toMatchObject({ title: 'Claude edited 1 file' })
+
+  const rereadSameTurn = applyTouches(edited, ['/a'], 'read', T0 + 1, 1)
+  expect(summaryOf(rereadSameTurn, idle())).toMatchObject({ title: 'Claude edited 1 file' })
+
+  const readLater = applyTouches(edited, ['/a'], 'read', T0 + 1, 2)
+  expect(readLater[0]?.kind).toBe('edited')
+  expect(summaryOf(readLater, idle({ turn: 2 }))).toMatchObject({ title: 'Claude read 1 file', barLabel: '1 read' })
+})
+
+test('of several files at once, the last named is the newest', () => {
+  expect(applyTouches([], ['/old', '/new'], 'edited', T0, 1).map(t => t.path)).toEqual(['/new', '/old'])
+})
+
+test('the newest touch comes first', () => {
+  const list = applyTouches(applyTouches([], ['/a'], 'read', T0, 1), ['/b'], 'read', T0 + 1, 1)
+  expect(list.map(t => t.path)).toEqual(['/b', '/a'])
+})
+
+test('git status: branch, codes, renames, untracked and ignored', () => {
+  const toPath = pathMapper(ROOT, ROOT, '')
+  const out = ['## main...origin/main [ahead 2, behind 1]', ' M src/a b.ts', 'R  new.ts', 'old.ts', '?? fresh.ts', '!! node_modules/', '?? nested/', ''].join('\0')
+  const parsed = parseStatus(out, toPath)
+  expect(parsed).toMatchObject({ branch: 'main', ahead: 2, behind: 1, ignored: ['/work/app/node_modules'] })
+  expect(Object.keys(parsed.changes).sort()).toEqual(['/work/app/fresh.ts', '/work/app/new.ts', '/work/app/src/a b.ts'])
+  expect(parsed.changes['/work/app/new.ts']?.code).toBe('R')
+  expect(parsed.changes['/work/app/fresh.ts']?.code).toBe('?')
+})
+
+test('a huge number of changed files is cut, and the count stays true', () => {
+  const lines = Array.from({ length: MAX_CHANGES + 5 }, (_, i) => `?? f${i}`)
+  const parsed = parseStatus(['## main', ...lines, ''].join('\0'), p => p)
+  expect(Object.keys(parsed.changes)).toHaveLength(MAX_CHANGES)
+  expect(parsed.changedTotal).toBe(MAX_CHANGES + 5)
+})
+
+test('only real commits count, back to where HEAD last stood', () => {
+  const entries = parseReflog(
+    [
+      'ccc3\0commit: third',
+      'bbb2\0checkout: moving from a to b',
+      'bbb1\0commit (amend): second',
+      'aaa1\0commit (initial): first',
+      'zzz0\0commit: older',
+      '',
+    ].join('\n'),
+  )
+  expect(commitsSince(entries, 'aaa')).toEqual(['ccc3', 'bbb1'])
+  expect(commitsSince(entries, '')).toEqual(['ccc3', 'bbb1', 'aaa1', 'zzz0'])
+  expect(commitsSince(parseReflog('ddd\0reset: moving to HEAD~1\neee\0pull: Fast-forward\n'), 'fff')).toEqual([])
+})
+
+test('two git views are compared by what they say', () => {
+  const view: GitView = { ...NO_GIT, isRepo: true, changes: { '/a': { code: 'M', added: 1, removed: 0 } }, ignored: ['/x'] }
+  expect(sameGitView(view, structuredClone(view))).toBe(true)
+  expect(sameGitView(view, { ...view, head: 'abc' })).toBe(false)
+  expect(sameGitView(view, { ...view, changes: { '/a': { code: 'M', added: 2, removed: 0 } } })).toBe(false)
+  expect(sameGitView(view, { ...view, ignored: ['/y'] })).toBe(false)
+})
+
+test('two listings are compared by what they hold', () => {
+  const listing: Listing = { entries: [{ name: 'a', isDir: false, isLink: false, size: 1, mtimeMs: T0 }], total: 1 }
+  expect(sameListing(listing, structuredClone(listing))).toBe(true)
+  expect(sameListing(listing, undefined)).toBe(false)
+  expect(sameListing(undefined, undefined)).toBe(true)
+  expect(sameListing(listing, { entries: [{ name: 'a', isDir: false, isLink: false, size: 1, mtimeMs: T0 + 1 }], total: 1 })).toBe(false)
+})
+
+test('a repository with no commits still has a branch', () => {
+  expect(parseStatus('## No commits yet on trunk\0', p => p).branch).toBe('trunk')
+  expect(parseStatus('## HEAD (no branch)\0', p => p).branch).toBe('detached')
+})
+
+test('numstat reads counts, and a binary file counts as nothing', () => {
+  const counts = parseNumstat('3\t1\ta.ts\0-\t-\tb.png\0', p => `/r/${p}`)
+  expect(counts.get('/r/a.ts')).toEqual([3, 1])
+  expect(counts.get('/r/b.png')).toEqual([0, 0])
+})
+
+test("from a subfolder, git's paths land on the tree's spelling", () => {
+  const toPath = pathMapper('/link/sub', '/real/repo', 'sub/')
+  expect(toPath('sub/a.ts')).toBe('/link/sub/a.ts')
+  expect(toPath('other/b.ts')).toBe('/real/repo/other/b.ts')
+})
+
+test('rows: folders first, opened folders nested, numbers in order', () => {
+  const entry = (name: string, isDir = false) => ({ name, isDir, isLink: false, size: 1, mtimeMs: T0 })
+  const lists = {
+    [ROOT]: listingOf([entry('b10.ts'), entry('b2.ts'), entry('src', true), entry('.env')]),
+    [`${ROOT}/src`]: listingOf([entry('x.ts')]),
+  }
+  const rows = buildRows(emptyLayout({ expanded: [`${ROOT}/src`] }), lists, new Set())
+  expect(rows.map(r => `${r.depth}:${r.name}`)).toEqual(['0:src', '1:x.ts', '0:.env', '0:b2.ts', '0:b10.ts'])
+  expect(buildRows(emptyLayout({ showHidden: false }), lists, new Set()).map(r => r.name)).toEqual(['src', 'b2.ts', 'b10.ts'])
+})
+
+test('only open folders whose parents are open need reading', () => {
+  const layout = emptyLayout({ expanded: [`${ROOT}/a`, `${ROOT}/a/b`, `${ROOT}/x/y`, '/elsewhere'] })
+  expect(visibleFolders(layout)).toEqual([`${ROOT}/a`, `${ROOT}/a/b`])
+})
+
+test('a folder open with nothing read yet draws closed, not open and empty', () => {
+  const entry = { name: 'src', isDir: true, isLink: false, size: 0, mtimeMs: 0 }
+  const rows = buildRows(emptyLayout({ expanded: [`${ROOT}/src`] }), { [ROOT]: listingOf([entry]) }, new Set())
+  expect(rows[0]?.isOpen).toBe(false)
+})
+
+test('rows: an ignored folder passes that on, and a long folder says how much is cut', () => {
+  const entry = (name: string, isDir = false) => ({ name, isDir, isLink: false, size: 1, mtimeMs: T0 })
+  const lists = {
+    [ROOT]: { entries: [entry('dist', true)], total: 5 },
+    [`${ROOT}/dist`]: listingOf([entry('a.js')]),
+  }
+  const rows = buildRows(emptyLayout({ expanded: [`${ROOT}/dist`] }), lists, new Set([`${ROOT}/dist`]))
+  expect(rows.map(r => r.isIgnored)).toEqual([true, true, false])
+  expect(rows[2]?.more).toBe(4)
+})
+
+test('opening for Claude leaves .git, node_modules and ignored folders shut', () => {
+  const layout = emptyLayout({ expanded: [`${ROOT}/src`] })
+  expect(foldersToOpen(layout, [`${ROOT}/src/deep/a.ts`], new Set())).toEqual([`${ROOT}/src/deep`])
+  expect(foldersToOpen(layout, [`${ROOT}/.git/config`], new Set())).toEqual([])
+  expect(foldersToOpen(layout, [`${ROOT}/node_modules/x/a.js`], new Set())).toEqual([])
+  expect(foldersToOpen(layout, [`${ROOT}/dist/a.js`], new Set([`${ROOT}/dist`]))).toEqual([])
+  expect(foldersToOpen(layout, ['/elsewhere/a.ts'], new Set())).toEqual([])
+})
+
+test('when the person asks, even those open', () => {
+  const layout = emptyLayout()
+  expect(foldersToOpen(layout, [`${ROOT}/node_modules/x/a.js`], new Set(), true)).toEqual([`${ROOT}/node_modules`, `${ROOT}/node_modules/x`])
+  expect(foldersToOpen(layout, [`${ROOT}/dist/a.js`], new Set([`${ROOT}/dist`]), true)).toEqual([`${ROOT}/dist`])
+})
+
+test('using a file pins the folders above it, and no others', () => {
+  const layout = emptyLayout({ autoOpened: { [`${ROOT}/a`]: T0, [`${ROOT}/a/b`]: T0, [`${ROOT}/z`]: T0 } })
+  expect(Object.keys(withPinned(layout, `${ROOT}/a/b/file.ts`).autoOpened)).toEqual([`${ROOT}/z`])
+})
+
+test('a mention is relative to the session, not to the tree', () => {
+  expect(mentionPath(ROOT, `${ROOT}/src/a.ts`)).toBe('src/a.ts')
+  expect(mentionPath(ROOT, '/work/other/a.ts')).toBe('/work/other/a.ts')
+})
+
+test('Windows paths have tops of their own', () => {
+  expect(dirname('C:/work')).toBe('C:/')
+  expect(dirname('C:/work/a')).toBe('C:/work')
+  expect(dirname('C:/')).toBe('C:/')
+  expect(resolvePath('C:/work', '..')).toBe('C:/')
+  expect(isTopFolder('C:/')).toBe(true)
+  expect(isTopFolder('/')).toBe(true)
+  expect(isTopFolder('/work')).toBe(false)
+})
+
+test('a folder opened for reads closes once quiet; one holding an edit stays', () => {
+  const dir = `${ROOT}/src`
+  const layout = emptyLayout({ expanded: [dir], autoOpened: { [dir]: T0 } })
+  const read = [touch(`${dir}/a.ts`, 'read')]
+  expect(foldersToClose(layout, read, T0 + AUTO_CLOSE_MS - 1)).toEqual([])
+  expect(foldersToClose(layout, read, T0 + AUTO_CLOSE_MS)).toEqual([dir])
+  expect(foldersToClose(layout, [touch(`${dir}/a.ts`, 'edited')], T0 + AUTO_CLOSE_MS * 9)).toEqual([])
+})
+
+test('only what changed during the call is put down to Claude', () => {
+  const since = T0
+  const candidates = [
+    { path: '/old', mtimeMs: T0 - 5000 },
+    { path: '/new', mtimeMs: T0 + 100 },
+    { path: '/known', mtimeMs: T0 + 100 },
+  ]
+  expect(pickChanged(candidates, since, [touch('/known', 'edited', { lastAt: T0 })])).toEqual(['/new'])
+  const many = Array.from({ length: 80 }, (_, i) => ({ path: `/f${i}`, mtimeMs: T0 + i }))
+  const newest = pickChanged(many, since, [])
+  expect(newest).toHaveLength(MAX_ATTRIBUTED)
+  expect(newest[newest.length - 1]).toBe('/f79')
+})
+
+test('the card says what is happening, then what happened', () => {
+  expect(summaryOf([], idle({ turn: 0 })).status).toBe('READY')
+  expect(summaryOf([], idle({ isWorking: true })).title).toBe('Claude is working')
+
+  const working = idle({ isWorking: true, working: [{ id: '1', kind: 'edited', paths: ['/a/client.js', '/a/b.js'] }] })
+  expect(summaryOf([], working)).toMatchObject({ status: 'EDITING', title: 'Claude is editing client.js +1', tone: 'edited' })
+
+  const done = [touch('/a', 'edited'), touch('/b', 'read')]
+  expect(summaryOf(done, idle())).toMatchObject({ status: 'DONE', title: 'Claude edited 1 file', path: '/a', barLabel: '1 edited · 1 read' })
+  expect(summaryOf([touch('/a', 'committed'), touch('/c', 'committed')], idle()).title).toBe('Claude committed 2 files')
+})
+
+test('find ranks the name over the path', () => {
+  const paths = ['/r/zclient/a.ts', '/r/src/client.ts', '/r/src/my-client.ts', '/r/c-l-i.ts']
+  expect(findFiles(paths, 'client')).toEqual(['/r/src/client.ts', '/r/src/my-client.ts', '/r/zclient/a.ts'])
+  expect(findFiles(paths, 'cli')).toContain('/r/c-l-i.ts')
+  expect(findFiles(paths, '  ')).toEqual([])
+})
+
+test('small words', () => {
+  expect(countLines('')).toBe(0)
+  expect(countLines('a\nb\n')).toBe(2)
+  expect(countLines('a\nb')).toBe(2)
+  expect(formatSize(512)).toBe('512 B')
+  expect(formatSize(2048)).toBe('2.0 K')
+  expect(formatSize(1_048_575)).toBe('1.0 M')
+  expect(formatSize(1023 * 1024)).toBe('1023 K')
+  expect(clip('abcdef', 4)).toBe('abc…')
+  expect(clip('abcdef', 1)).toBe('…')
+  expect(clip('abcdef', 0)).toBe('')
+  expect(clip('abcdef', -3)).toBe('')
+})
+
+test('a file named after an object method gets the default chip', () => {
+  for (const name of ['constructor', 'constructor.ts', 'foo.constructor', '__proto__', 'toString', 'hasOwnProperty.js']) {
+    expect(chipOf(name, GLYPHS.plain).label.length).toBeGreaterThan(0)
+  }
+  expect(chipOf('constructor', GLYPHS.plain).label).toBe('··')
+  expect(chipOf('constructor.ts', GLYPHS.plain).label).toBe('TS')
+})
+
+const ICONS = JSON.stringify({
+  file: 'file',
+  folder: 'folder',
+  folderOpen: 'folder-open',
+  fileNames: { 'readme.md': 'readme', '.gitignore': 'git', 'CLAUDE.md': 'claude', '.config/graphqlrc': 'graphql' },
+  extensions: { 'test.ts': 'test-ts', ts: 'typescript', js: 'javascript' },
+  folderNames: { src: 'folder-src', '.git': 'folder-git', 'META-INF': 'folder-config', '.github/workflows': 'folder-gh-workflows' },
+})
+
+test('a name finds its icon: whole name, longest extension, then the default', () => {
+  const map = parseIconMap(ICONS)
+  if (!map) throw new Error('the map should parse')
+  expect(iconOf(map, 'README.md', false, false)).toBe('readme')
+  expect(iconOf(map, '.gitignore', false, false)).toBe('git')
+  expect(iconOf(map, 'client.test.ts', false, false)).toBe('test-ts')
+  expect(iconOf(map, 'client.ts', false, false)).toBe('typescript')
+  expect(iconOf(map, 'notes.xyz', false, false)).toBe('file')
+  expect(iconOf(map, 'Makefile', false, false)).toBe('file')
+  expect(iconOf(map, 'constructor', false, false)).toBe('file')
+  expect(iconOf(map, 'a.constructor', false, false)).toBe('file')
+})
+
+test('names of any case match, and some names go by their folder too', () => {
+  const map = parseIconMap(ICONS)
+  if (!map) throw new Error('the map should parse')
+  expect(iconOf(map, '/r/CLAUDE.md', false, false)).toBe('claude')
+  expect(iconOf(map, '/r/claude.MD', false, false)).toBe('claude')
+  expect(iconOf(map, '/r/META-INF', true, false)).toBe('folder-config')
+  expect(iconOf(map, '/r/.config/graphqlrc', false, false)).toBe('graphql')
+  expect(iconOf(map, '/r/graphqlrc', false, false)).toBe('file')
+  expect(iconOf(map, '/r/.github/workflows', true, false)).toBe('folder-gh-workflows')
+  expect(iconOf(map, '/r/workflows', true, false)).toBe('folder')
+})
+
+test('a folder finds its icon, open or closed', () => {
+  const map = parseIconMap(ICONS)
+  if (!map) throw new Error('the map should parse')
+  expect(iconOf(map, 'SRC', true, false)).toBe('folder-src')
+  expect(iconOf(map, 'src', true, true)).toBe('folder-src-open')
+  expect(iconOf(map, 'anything', true, false)).toBe('folder')
+  expect(iconOf(map, 'anything', true, true)).toBe('folder-open')
+  expect(iconOf(map, '__proto__', true, false)).toBe('folder')
+})
+
+test('a broken icon map is refused', () => {
+  expect(parseIconMap('not json')).toBeNull()
+  expect(parseIconMap('{"file":1}')).toBeNull()
+  expect(parseIconMap('null')).toBeNull()
+})
+
+test('pictures are used where the terminal can draw them', () => {
+  const file = { via: 'file', needsFullscreen: false }
+  expect(imagePlanOf('auto', { TERM_PROGRAM: 'ghostty', TERM: 'xterm-256color' })).toEqual(file)
+  expect(imagePlanOf('auto', { TERM: 'xterm-ghostty' })).toEqual(file)
+  expect(imagePlanOf('auto', { TERM: 'xterm-kitty' })).toEqual(file)
+  expect(imagePlanOf('auto', { KITTY_WINDOW_ID: '1', TERM: 'xterm-256color' })).toEqual(file)
+  expect(imagePlanOf('auto', { TERM_PROGRAM: 'iTerm.app', TERM_PROGRAM_VERSION: '3.5.2' })).toEqual({ via: 'bytes', needsFullscreen: true })
+  expect(imagePlanOf(undefined, { TERM_PROGRAM: 'ghostty' })).toEqual(file)
+})
+
+test('anywhere else, or when told not to, the chips stay', () => {
+  expect(imagePlanOf('chips', { TERM_PROGRAM: 'ghostty' })).toBeNull()
+  expect(imagePlanOf('auto', { TERM_PROGRAM: 'Apple_Terminal' })).toBeNull()
+  expect(imagePlanOf('auto', { TERM_PROGRAM: 'vscode', KITTY_WINDOW_ID: '1' })).toBeNull()
+  expect(imagePlanOf('auto', { TERM_PROGRAM: 'iTerm.app', TERM_PROGRAM_VERSION: '3.4.9' })).toBeNull()
+  expect(imagePlanOf('auto', { TERM_PROGRAM: 'ghostty', TMUX: '/tmp/tmux' })).toBeNull()
+  expect(imagePlanOf('auto', { TERM_PROGRAM: 'ghostty', SSH_CONNECTION: '1 2 3 4' })).toBeNull()
+  expect(imagePlanOf('auto', { TERM_PROGRAM: 'ghostty', ZELLIJ: '0' })).toBeNull()
+  expect(imagePlanOf('auto', { TERM_PROGRAM: 'ghostty', STY: '1.pts' })).toBeNull()
+})
+
+test('images forces pictures, as bytes, where auto would not try', () => {
+  const bytes = { via: 'bytes', needsFullscreen: false }
+  expect(imagePlanOf('images', { TERM_PROGRAM: 'ghostty', TMUX: '/tmp/tmux' })).toEqual(bytes)
+  expect(imagePlanOf('images', { TERM_PROGRAM: 'WezTerm' })).toEqual(bytes)
+})
+
+// The engine, standing in for the machine: one small project on a fake disk.
+
+type Disk = Record<string, { size?: number; mtimeMs?: number } | 'dir'>
+type Git = {
+  status: string
+  numstat: string
+  head: string
+  shown: string
+  reflog: string
+  /** Set to make `rev-parse` fail. */
+  revParse?: { stderr: string }
+  /** The git subcommands run, in order, and the arguments of `show`. */
+  runs: string[]
+  showArgs: string[]
+}
+
+const DISK: Disk = {
+  [ROOT]: 'dir',
+  [`${ROOT}/src`]: 'dir',
+  [`${ROOT}/src/client.js`]: { size: 40, mtimeMs: T0 - 60_000 },
+  [`${ROOT}/README.md`]: { size: 90, mtimeMs: T0 - 60_000 },
+}
+
+const PANE = {
+  plugin: 'file-tree',
+  component: 'Pane',
+  requestId: 'file-tree',
+  props: { title: 'Files', isFocused: false, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 40 }, view: {} },
+} as const
+
+const BAND = {
+  plugin: 'file-tree',
+  component: 'AbovePrompt',
+  props: { hasSurvey: false, isWorking: false, maxRows: 4, bodyColumns: 100, scroll: { offset: 0, bodyRows: 4 }, view: {} },
+} as const
+
+const shown = () => ({ count: 0, isOpen: true })
+const closed = () => ({ count: 0, isOpen: false })
+
+type Standing = {
+  answer?: (id: string) => unknown
+  env?: Record<string, string>
+  /** The text of the icon map; left out, it cannot be read. */
+  icons?: string
+  /** What an icon's file holds, in base64. */
+  png?: string
+  /** Where the session is: change `cwd` to move it. */
+  where?: { cwd: string }
+  fills?: string[]
+  toasts?: string[]
+}
+
+// One transparent pixel: the engine reads the header of whatever it is handed.
+const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=='
+
+const stand = (on: On, disk: Disk, git: Git, opens: { count: number; isOpen?: boolean }, standing: Standing = {}) => {
+  const { answer = () => ({ result: {} }), env = {}, icons, png = PNG, where = { cwd: ROOT }, fills = [], toasts = [] } = standing
+  const clock = mock.clock(on, { now: T0 })
+  on('command.register', () => ({ value: { command: 'tree' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.cwd', () => ({ value: where.cwd }))
+  on('prompt.fill', (_, e) => {
+    fills.push(e.text)
+    return { isFilled: true, text: e.text, cursor: e.text.length } as never
+  })
+  on('ui.toast', (_, e) => {
+    toasts.push(String((e as { text?: unknown }).text ?? ''))
+    return { value: undefined } as never
+  })
+  on('ui.render', ($, e) => {
+    const { Box } = $.ui.resolve(e)
+    return <Box />
+  })
+  on('env.get', (_, e) => ({ value: e.name === 'HOME' ? '/home/me' : env[e.name] }))
+  on('fs.list', (_, e) => {
+    const prefix = `${e.path}/`
+    const value = Object.entries(disk)
+      .filter(([path]) => path.startsWith(prefix) && !path.slice(prefix.length).includes('/'))
+      .map(([path, node]) => ({
+        name: path.slice(prefix.length),
+        kind: node === 'dir' ? ('dir' as const) : ('file' as const),
+        size: node === 'dir' ? 0 : (node.size ?? 0),
+        mtimeMs: node === 'dir' ? 0 : (node.mtimeMs ?? 0),
+        isLink: false,
+      }))
+    return { value }
+  })
+  on('fs.stat', (_, e) => {
+    const node = disk[e.path]
+    if (!node) throw new Error('ENOENT')
+    return {
+      value: {
+        kind: node === 'dir' ? ('dir' as const) : ('file' as const),
+        size: node === 'dir' ? 0 : (node.size ?? 0),
+        mtimeMs: node === 'dir' ? 0 : (node.mtimeMs ?? 0),
+        isLink: false,
+      },
+    }
+  })
+  on('fs.read', (_, e) => {
+    if (e.as === 'bytes') return { value: { base64: png } }
+    if (!e.path.endsWith('map.json')) return { value: 'one\ntwo\n' }
+    if (icons === undefined) throw new Error('ENOENT')
+    return { value: icons }
+  })
+  on('process.run', (_, e) => {
+    const args = e.argv.slice(4)
+    const done = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
+    git.runs.push(args[0] ?? '')
+    if (args[0] === 'rev-parse') {
+      if (git.revParse) return { value: { exitCode: 128, stdout: '', stderr: git.revParse.stderr, isStdoutTruncated: false, isStderrTruncated: false } }
+      return done(`${ROOT}\n\n${ROOT}/.git\n`)
+    }
+    if (args[0] === 'status') return done(git.status)
+    if (args[0] === 'diff') return done(git.numstat)
+    if (args[0] === 'log') return done(git.head)
+    if (args[0] === 'reflog') return done(git.reflog)
+    if (args[0] === 'show') {
+      git.showArgs = args
+      return done(git.shown)
+    }
+    if (args[0] === 'ls-files') return done('src/client.js\0README.md\0')
+    return { value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  on('ui.open', () => {
+    opens.count++
+    opens.isOpen = true
+    return { value: { isPlaced: true } }
+  })
+  on('ui.close', () => {
+    opens.isOpen = false
+    return { value: undefined }
+  })
+  on('ui.panes', () => ({ value: opens.isOpen ? [{ id: 'file-tree', title: 'Files', isPlaced: true }] : [] }) as never)
+  on('ui.scroll', () => ({}) as never)
+  on('tool.call', (_, e) => answer(e.tool_use_id) as never)
+  on('turn.complete', () => ({ text: '' }) as never)
+  return clock
+}
+
+const cleanGit = (): Git => ({ status: '## main\0', numstat: '', head: 'aaa1111', shown: '', reflog: '', runs: [], showArgs: [] })
+
+const boot = async ($: Engine, isInteractive = true) => {
+  await $.session.start({ cwd: ROOT, surface: 'terminal', isInteractive } as never)
+}
+
+/** Draws the band, which is how the mod learns whether a pane would dock. */
+const seat = async ($: Engine, isFullscreen: boolean) => {
+  const band = await $.ui.mount({ ...BAND, surface: 'terminal', viewport: { columns: 160, rows: 50, isFullscreen } })
+  await band.unmount()
+}
+
+const runTree = ($: Engine) => ($.command.run as (e: unknown) => Promise<unknown>)({ command: 'tree', args: '' })
+
+const callTool = ($: Engine, tool: string, input: Record<string, unknown>, id = 'tool-1') =>
+  ($.tool.call as (e: unknown) => Promise<unknown>)({ tool, tool_use_id: id, ...input })
+
+test('an edit lights the file, opens its folder and takes the pill', async ($, on) => {
+  const clock = stand(on, DISK, cleanGit(), shown())
+  await boot($)
+  await clock.advance(400)
+  await callTool($, 'Edit', { file_path: `${ROOT}/src/client.js`, old_string: 'a', new_string: 'b' })
+  await clock.advance(400)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Button', key: `open:${ROOT}/src/client.js` } as never)).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^edited$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /CLAUDE TOUCHED/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /Claude edited 1 file/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a read is purple and says read', async ($, on) => {
+  const clock = stand(on, DISK, cleanGit(), shown())
+  await boot($)
+  await clock.advance(400)
+  await callTool($, 'Read', { file_path: 'README.md' })
+  await clock.advance(1)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^read$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /Claude read 1 file/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a denied or failed call leaves no mark', async ($, on) => {
+  const clock = stand(on, DISK, cleanGit(), shown(), { answer: id => (id === 'denied' ? { deny: 'no' } : { result: 'bad', isError: true }) })
+  await boot($)
+  await clock.advance(400)
+  await callTool($, 'Edit', { file_path: `${ROOT}/README.md` }, 'denied')
+  await callTool($, 'Edit', { file_path: `${ROOT}/README.md` }, 'failed')
+  await clock.advance(400)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /CLAUDE TOUCHED/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /Nothing touched yet/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a file a shell command changed is found by git and its date', async ($, on) => {
+  const disk: Disk = { ...DISK, [`${ROOT}/README.md`]: { size: 90, mtimeMs: T0 + 50 } }
+  const git = cleanGit()
+  const clock = stand(on, disk, git, shown())
+  await boot($)
+  await clock.advance(400)
+  git.status = '## main\0 M README.md\0'
+  git.numstat = '4\t2\tREADME.md\0'
+  await callTool($, 'Bash', { command: 'python3 fix.py' })
+  await clock.advance(500)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^edited$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^\+4$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /1 changed/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a commit turns edited files committed and names itself', async ($, on) => {
+  const git = cleanGit()
+  const clock = stand(on, DISK, git, shown())
+  await boot($)
+  await clock.advance(400)
+  await callTool($, 'Edit', { file_path: `${ROOT}/README.md` })
+  await clock.advance(400)
+  git.head = 'bbb2222'
+  git.reflog = 'bbb2222fff\0commit: Raise retries\n'
+  git.shown = 'README.md\0src/client.js\0'
+  await callTool($, 'Bash', { command: 'git commit -am x' })
+  await clock.advance(500)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^committed$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /bbb2222/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /Claude committed 1 file/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('someone else committing what Claude never touched changes nothing', async ($, on) => {
+  const git = cleanGit()
+  const clock = stand(on, DISK, git, shown())
+  await boot($)
+  await clock.advance(400)
+  git.head = 'ccc3333'
+  git.reflog = 'ccc3333fff\0commit: theirs\n'
+  git.shown = 'README.md\0'
+  await callTool($, 'Bash', { command: 'make' })
+  await clock.advance(500)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /ccc3333/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('a checkout moves HEAD but commits nothing', async ($, on) => {
+  const git = cleanGit()
+  const clock = stand(on, DISK, git, shown())
+  await boot($)
+  await clock.advance(400)
+  await callTool($, 'Edit', { file_path: `${ROOT}/README.md` })
+  await clock.advance(400)
+  git.head = 'ddd4444'
+  git.reflog = 'ddd4444fff\0checkout: moving from main to other\n'
+  git.shown = 'README.md\0'
+  await callTool($, 'Bash', { command: 'git checkout other' })
+  await clock.advance(500)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^committed$/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /^edited$/ })).toBeDefined()
+  expect(git.showArgs).toEqual([])
+  await ui.unmount()
+})
+
+test('the first commit of a new repository counts', async ($, on) => {
+  const git = { ...cleanGit(), head: '' }
+  const clock = stand(on, DISK, git, shown())
+  await boot($)
+  await clock.advance(400)
+  await callTool($, 'Edit', { file_path: `${ROOT}/README.md` })
+  await clock.advance(400)
+  git.head = 'eee5555'
+  git.reflog = 'eee5555fff\0commit (initial): first\n'
+  git.shown = 'README.md\0'
+  await callTool($, 'Bash', { command: 'git commit -m first' })
+  await clock.advance(500)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^committed$/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('several commits between looks are all read', async ($, on) => {
+  const git = cleanGit()
+  const clock = stand(on, DISK, git, shown())
+  await boot($)
+  await clock.advance(400)
+  await callTool($, 'Edit', { file_path: `${ROOT}/README.md` }, 'a')
+  await callTool($, 'Edit', { file_path: `${ROOT}/src/client.js` }, 'b')
+  await clock.advance(400)
+  git.head = 'ggg7777'
+  git.reflog = 'ggg7777fff\0commit: b\nfff6666fff\0commit: a\naaa1111fff\0commit: base\n'
+  git.shown = 'README.md\0src/client.js\0'
+  await callTool($, 'Bash', { command: 'git commit a && git commit b' })
+  await clock.advance(500)
+
+  expect(git.showArgs.slice(-2)).toEqual(['ggg7777fff', 'fff6666fff'])
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^edited$/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /Claude committed 2 files/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a git hiccup keeps what was known, and only "not a repository" clears it', async ($, on) => {
+  const git = { ...cleanGit(), status: '## main\0 M README.md\0' }
+  const clock = stand(on, DISK, git, shown())
+  await boot($)
+  await clock.advance(400)
+
+  git.revParse = { stderr: 'fatal: unable to read something' }
+  await callTool($, 'Bash', { command: 'make' })
+  await clock.advance(500)
+  const during = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await during.find({ type: 'Text', text: /1 changed/ })).toBeDefined()
+  await during.unmount()
+
+  git.revParse = { stderr: 'fatal: not a git repository (or any of the parent directories): .git' }
+  await callTool($, 'Bash', { command: 'make' })
+  await clock.advance(500)
+  const after = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await after.find({ type: 'Text', text: /1 changed/ })).toBeUndefined()
+  await after.unmount()
+})
+
+test('with no panel to draw, git is left alone, and opening picks up what happened', async ($, on) => {
+  const disk: Disk = { ...DISK, [`${ROOT}/README.md`]: { size: 90, mtimeMs: T0 + 900 } }
+  const git = cleanGit()
+  const opens = closed()
+  const clock = stand(on, disk, git, opens)
+  await boot($)
+  await clock.advance(400)
+  git.status = '## main\0 M README.md\0'
+  await callTool($, 'Bash', { command: 'python3 fix.py' })
+  await clock.advance(500)
+  expect(git.runs).toEqual([])
+
+  await runTree($)
+  await clock.advance(500)
+  expect(git.runs).toContain('status')
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /^edited$/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('without a person watching, nothing is tracked', async ($, on) => {
+  const git = cleanGit()
+  const clock = stand(on, DISK, git, shown())
+  await boot($, false)
+  await callTool($, 'Edit', { file_path: `${ROOT}/README.md` })
+  await callTool($, 'Bash', { command: 'make' })
+  await clock.advance(500)
+  expect(git.runs).toEqual([])
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /CLAUDE TOUCHED/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('a command known only to look credits nothing to Claude, and looks at nothing', async ($, on) => {
+  const disk: Disk = { ...DISK, [`${ROOT}/README.md`]: { size: 90, mtimeMs: T0 + 900 } }
+  const git = { ...cleanGit(), status: '## main\0 M README.md\0' }
+  const clock = stand(on, disk, git, shown())
+  await boot($)
+  await clock.advance(400)
+  const before = git.runs.length
+  await callTool($, 'Bash', { command: 'sleep 1 && ls' })
+  await clock.advance(500)
+  expect(git.runs.length).toBe(before)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /CLAUDE TOUCHED/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+
+test('a cd inside the project leaves the tree as it was', async ($, on) => {
+  const where = { cwd: ROOT }
+  const clock = stand(on, DISK, cleanGit(), shown(), { where })
+  await boot($)
+  await clock.advance(400)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: `open:${ROOT}/src` })
+  where.cwd = `${ROOT}/src`
+  await callTool($, 'Bash', { command: 'make' })
+  await clock.advance(500)
+  expect(await ui.find({ type: 'Button', key: `open:${ROOT}/src/client.js` } as never)).toBeDefined()
+  expect(await ui.find({ type: 'Button', key: 'back' } as never)).toBeUndefined()
+  await ui.unmount()
+})
+
+test('moving out of the project moves the tree', async ($, on) => {
+  const disk: Disk = { ...DISK, '/work/other': 'dir', '/work/other/x.ts': { size: 1, mtimeMs: T0 } }
+  const where = { cwd: ROOT }
+  const clock = stand(on, disk, cleanGit(), shown(), { where })
+  await boot($)
+  await clock.advance(400)
+  where.cwd = '/work/other'
+  await callTool($, 'Bash', { command: 'make' })
+  await clock.advance(500)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Button', key: 'open:/work/other/x.ts' } as never)).toBeDefined()
+  await ui.unmount()
+})
+
+test('a file clicked after Up a folder is mentioned from the session, not the tree', async ($, on) => {
+  const disk: Disk = { ...DISK, '/work': 'dir' }
+  const fills: string[] = []
+  const clock = stand(on, disk, cleanGit(), shown(), { fills })
+  await boot($)
+  await clock.advance(400)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'up' })
+  await ui.press({ key: `open:${ROOT}` })
+  await ui.press({ key: `open:${ROOT}/README.md` })
+  expect(fills).toEqual(['@README.md '])
+  await ui.unmount()
+})
+
+test('a hidden-only folder says so when hidden files are off', async ($, on) => {
+  const disk: Disk = { [ROOT]: 'dir', [`${ROOT}/.env`]: { size: 1, mtimeMs: T0 } }
+  const clock = stand(on, disk, cleanGit(), shown())
+  await boot($)
+  await clock.advance(400)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'hidden' })
+  expect(await ui.find({ type: 'Text', text: /Only hidden files here/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('clicking a touched file inside an ignored folder still finds it', async ($, on) => {
+  const disk: Disk = { ...DISK, [`${ROOT}/dist`]: 'dir', [`${ROOT}/dist/x.js`]: { size: 1, mtimeMs: T0 } }
+  const git = { ...cleanGit(), status: '## main\0!! dist/\0' }
+  const clock = stand(on, disk, git, shown())
+  await boot($)
+  await clock.advance(400)
+  await callTool($, 'Read', { file_path: `${ROOT}/dist/x.js` })
+  await clock.advance(400)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Button', key: `open:${ROOT}/dist/x.js` } as never)).toBeUndefined()
+  await ui.press({ key: `show:touched:${ROOT}/dist/x.js` })
+  expect(await ui.find({ type: 'Button', key: `open:${ROOT}/dist/x.js` } as never)).toBeDefined()
+  await ui.unmount()
+})
+
+test('clicking a touched file outside the tree says why nothing moved', async ($, on) => {
+  const disk: Disk = { ...DISK, '/elsewhere': 'dir', '/elsewhere/a.ts': { size: 1, mtimeMs: T0 } }
+  const toasts: string[] = []
+  const clock = stand(on, disk, cleanGit(), shown(), { toasts })
+  await boot($)
+  await clock.advance(400)
+  await callTool($, 'Read', { file_path: '/elsewhere/a.ts' })
+  await clock.advance(400)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'show:touched:/elsewhere/a.ts' })
+  expect(toasts.join()).toContain('outside this tree')
+  await ui.unmount()
+})
+
+test('a folder opened for a read closes by itself, but not under someone using the panel', async ($, on) => {
+  const clock = stand(on, DISK, cleanGit(), shown())
+  await boot($)
+  await clock.advance(400)
+  const inside = { type: 'Button', key: `open:${ROOT}/src/client.js` } as never
+
+  const focused = await $.ui.mount({ ...PANE, surface: 'terminal', props: { ...PANE.props, isFocused: true } })
+  await callTool($, 'Read', { file_path: `${ROOT}/src/client.js` })
+  await clock.advance(AUTO_CLOSE_MS + 3000)
+  expect(await focused.find(inside)).toBeDefined()
+  await focused.unmount()
+
+  const away = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await clock.advance(3000)
+  expect(await away.find(inside)).toBeUndefined()
+  await away.unmount()
+})
+
+test('the totals say when they are only a floor', async ($, on) => {
+  const many = Array.from({ length: 35 }, (_, i) => `?? new${i}.ts`).join('\0')
+  const clock = stand(on, DISK, { ...cleanGit(), status: `## main\0${many}\0` }, shown())
+  await boot($)
+  await clock.advance(400)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: /≥/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /35 changed/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('on Ghostty the rows draw picture icons, and an opened folder changes its own', async ($, on) => {
+  const clock = stand(on, DISK, cleanGit(), shown(), { env: { TERM_PROGRAM: 'ghostty' }, icons: ICONS })
+  await boot($)
+  await clock.advance(400)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const sources = async (): Promise<string[]> =>
+    (await ui.findAll({ type: 'Image' })).map(found => (found.props.source as { file: string }).file.split('/').pop() ?? '')
+
+  expect(await sources()).toEqual(['folder-src.png', 'readme.png'])
+  expect(await ui.find({ type: 'Text', text: /^MD$/ })).toBeUndefined()
+
+  await ui.press({ key: `open:${ROOT}/src` })
+  expect(await sources()).toEqual(['folder-src-open.png', 'javascript.png', 'readme.png'])
+  await ui.unmount()
+})
+
+test('where only bytes can reach the terminal, the picture carries them', async ($, on) => {
+  const env = { TERM_PROGRAM: 'iTerm.app', TERM_PROGRAM_VERSION: '3.5.2' }
+  const clock = stand(on, DISK, cleanGit(), shown(), { env, icons: ICONS })
+  await boot($)
+  await clock.advance(400)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Image' }))?.props.source).toEqual({ png: PNG })
+  await ui.unmount()
+})
+
+test('a damaged icon file costs only its row, which keeps a chip', async ($, on) => {
+  const env = { TERM_PROGRAM: 'iTerm.app', TERM_PROGRAM_VERSION: '3.5.2' }
+  const clock = stand(on, DISK, cleanGit(), shown(), { env, icons: ICONS, png: 'bm90IGEgcG5n' })
+  await boot($)
+  await clock.advance(400)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Image' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /README/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('without a capable terminal, or without the icon map, rows keep their chips', async ($, on) => {
+  const clock = stand(on, DISK, cleanGit(), shown(), { env: { TERM_PROGRAM: 'Apple_Terminal' }, icons: ICONS })
+  await boot($)
+  await clock.advance(400)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Image' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /MD/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('an icon map that cannot be read leaves the chips', async ($, on) => {
+  const clock = stand(on, DISK, cleanGit(), shown(), { env: { TERM_PROGRAM: 'ghostty' } })
+  await boot($)
+  await clock.advance(400)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Image' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /README/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('the pane draws on every surface', async ($, on) => {
+  const clock = stand(on, DISK, cleanGit(), shown())
+  await boot($)
+  await clock.advance(400)
+  await callTool($, 'Edit', { file_path: `${ROOT}/README.md` })
+  await clock.advance(400)
+  for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect(await ui.find({ type: 'Text', text: /ALL FILES/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: /^edited$/ })).toBeDefined()
+    await ui.unmount()
+  }
+})
+
+test('pressing a folder opens it, and Collapse all closes it', async ($, on) => {
+  const clock = stand(on, DISK, cleanGit(), shown())
+  await boot($)
+  await clock.advance(400)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const inside = { type: 'Button', key: `open:${ROOT}/src/client.js` } as never
+
+  expect(await ui.find(inside)).toBeUndefined()
+  await ui.press({ key: `open:${ROOT}/src` })
+  expect(await ui.find(inside)).toBeDefined()
+  await ui.press({ key: 'collapse' })
+  expect(await ui.find(inside)).toBeUndefined()
+  await ui.unmount()
+})
+
+test("a click lands on the row's click area, and no Button holds its name on the terminal", async ($, on) => {
+  const clock = stand(on, DISK, cleanGit(), shown())
+  await boot($)
+  await clock.advance(400)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const inside = { type: 'Button', key: `open:${ROOT}/src/client.js` } as never
+
+  expect(await ui.find({ type: 'Button', text: /README/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /README/ })).toBeDefined()
+
+  await ui.pointer({ type: 'down', x: 3, y: 0, in: `hit:open:${ROOT}/src` })
+  expect(await ui.find(inside)).toBeDefined()
+  // The right button does nothing: the folder stays open.
+  await ui.pointer({ type: 'down', x: 3, y: 0, button: 'right', in: `hit:open:${ROOT}/src` })
+  expect(await ui.find(inside)).toBeDefined()
+  await ui.unmount()
+
+  const desktop = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await desktop.find({ type: 'Button', key: `open:${ROOT}/README.md` } as never)).toBeDefined()
+  await desktop.unmount()
+})
+
+test('the toolbar hides dotfiles and offers the way back', async ($, on) => {
+  const disk: Disk = { ...DISK, [`${ROOT}/.env`]: { size: 1, mtimeMs: T0 }, '/work': 'dir' }
+  const clock = stand(on, disk, cleanGit(), shown())
+  await boot($)
+  await clock.advance(400)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+
+  expect(await ui.find({ type: 'Button', key: `open:${ROOT}/.env` } as never)).toBeDefined()
+  await ui.press({ key: 'hidden' })
+  expect(await ui.find({ type: 'Button', key: `open:${ROOT}/.env` } as never)).toBeUndefined()
+
+  expect(await ui.find({ type: 'Button', key: 'back' } as never)).toBeUndefined()
+  await ui.press({ key: 'up' })
+  expect(await ui.find({ type: 'Button', key: 'back' } as never)).toBeDefined()
+  await ui.press({ key: 'back' })
+  expect(await ui.find({ type: 'Button', key: 'back' } as never)).toBeUndefined()
+  await ui.unmount()
+})
+
+test('find lists matches in place of the tree, and Enter shows the file', async ($, on) => {
+  const clock = stand(on, DISK, cleanGit(), shown())
+  await boot($)
+  await clock.advance(400)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+
+  await ui.input({ key: 'find', text: 'client', kind: 'change' })
+  expect(await ui.find({ type: 'Text', text: /FOUND 1/ })).toBeDefined()
+  expect(await ui.find({ type: 'Button', key: `show:found:${ROOT}/src/client.js` } as never)).toBeDefined()
+
+  await ui.input({ key: 'find', text: 'client', kind: 'submit' })
+  expect(await ui.find({ type: 'Text', text: /ALL FILES/ })).toBeDefined()
+  expect(await ui.find({ type: 'Button', key: `open:${ROOT}/src/client.js` } as never)).toBeDefined()
+  await ui.unmount()
+})
+
+test('the first edit opens the pane once, and /tree toggles it', async ($, on) => {
+  const opens = closed()
+  const clock = stand(on, DISK, cleanGit(), opens)
+  await boot($)
+  await seat($, true)
+  await clock.advance(400)
+  await callTool($, 'Read', { file_path: `${ROOT}/README.md` })
+  await clock.advance(1)
+  expect(opens.count).toBe(0)
+  await callTool($, 'Edit', { file_path: `${ROOT}/README.md` }, 'a')
+  await clock.advance(1)
+  await callTool($, 'Edit', { file_path: `${ROOT}/README.md` }, 'b')
+  await clock.advance(1)
+  expect(opens.count).toBe(1)
+
+  expect(await runTree($)).toMatchObject({ text: 'File tree closed.' })
+  expect(await runTree($)).toMatchObject({ text: 'File tree opened.' })
+})
+
+test('unasked, the panel only opens where it docks', async ($, on) => {
+  const opens = closed()
+  const clock = stand(on, DISK, cleanGit(), opens)
+  await boot($)
+  await seat($, false)
+  await clock.advance(400)
+  await callTool($, 'Edit', { file_path: `${ROOT}/README.md` }, 'a')
+  await clock.advance(1)
+  expect(opens.count).toBe(0)
+
+  await seat($, true)
+  await callTool($, 'Edit', { file_path: `${ROOT}/README.md` }, 'b')
+  await clock.advance(1)
+  expect(opens.count).toBe(1)
+})
+
+test('having used /tree, the panel no longer opens by itself', async ($, on) => {
+  const opens = closed()
+  const clock = stand(on, DISK, cleanGit(), opens)
+  await boot($)
+  await seat($, true)
+  await clock.advance(400)
+  await runTree($)
+  await runTree($)
+  expect(opens.count).toBe(1)
+  await callTool($, 'Edit', { file_path: `${ROOT}/README.md` })
+  await clock.advance(1)
+  expect(opens.count).toBe(1)
+})
+
+test('the first edit leaves a panel that is already open alone, even above the prompt', async ($, on) => {
+  const opens = shown()
+  const clock = stand(on, DISK, cleanGit(), opens)
+  await boot($)
+  await seat($, true)
+  await clock.advance(400)
+  const inline = { ...PANE, surface: 'terminal', props: { ...PANE.props, placement: 'inline' } } as const
+  const ui = await $.ui.mount(inline)
+  await callTool($, 'Edit', { file_path: `${ROOT}/README.md` })
+  await clock.advance(400)
+  expect(opens).toMatchObject({ count: 0, isOpen: true })
+  expect(await ui.find({ type: 'Text', text: /ALL FILES/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a lit row outside the window is still drawn', async ($, on) => {
+  const disk: Disk = { ...DISK }
+  for (let i = 0; i < 300; i++) disk[`${ROOT}/file${String(i).padStart(3, '0')}.ts`] = { size: 1, mtimeMs: T0 }
+  const clock = stand(on, disk, cleanGit(), shown())
+  await boot($)
+  await clock.advance(400)
+  await callTool($, 'Edit', { file_path: `${ROOT}/file250.ts` })
+  await clock.advance(1)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Button', key: `open:${ROOT}/file250.ts` } as never)).toBeDefined()
+  expect(await ui.find({ type: 'Button', key: `open:${ROOT}/file200.ts` } as never)).toBeUndefined()
+  expect(await ui.find({ type: 'Button', key: `open:${ROOT}/file001.ts` } as never)).toBeDefined()
+  await ui.unmount()
+})
