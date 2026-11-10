@@ -26,11 +26,14 @@ import {
   formatTokens,
   isPlanComplete,
   isRunning,
+  listedAgentRun,
+  namedRun,
   newAgentRun,
   overviewOf,
   promptTokens,
   reportedSteps,
   resumeRun,
+  skillLabel,
   statusOfEngineAgent,
   statusOfTurnEnd,
   stepsFromTodos,
@@ -50,6 +53,8 @@ const TICK_MS = 500
 const TICKS_PER_RECONCILE = 8
 const MAX_FINISHED_SHOWN = 30
 const PANE_INSET = 2
+// The type of a forked skill's row, however the mod first heard of it.
+const SKILL_TYPE = 'skill'
 
 const ACCENT = '#8f8cf4'
 const DONE = '#5fbf8f'
@@ -125,6 +130,60 @@ async function togglePane($: EngineInterface): Promise<PaneAnswer> {
   return openPane($)
 }
 
+// Asked once a session, when the first subagent starts.
+async function autoOpen($: EngineInterface, mayOpen: boolean): Promise<void> {
+  if (!mayOpen || (await read($, layout)).hasAutoOpened) return
+  try {
+    await $.ui.open({ id: PANE, title: PANE_TITLE })
+    await update($, layout, prev => ({ ...prev, hasAutoOpened: true }))
+  } catch {
+    // Refused this time: the next subagent asks again.
+  }
+}
+
+/**
+ * Adds or changes one subagent's row: `change` gets the row there is, if any,
+ * and returns the row to keep, or nothing (or that same row) to leave the list
+ * as it was. A changed row moves to the end, the newest; one left running also
+ * wakes the clock and may open the panel.
+ */
+async function upsertAgent(
+  $: EngineInterface,
+  id: string,
+  change: (earlier: AgentRun | undefined) => AgentRun | undefined,
+  at: number,
+  mayOpen: boolean,
+): Promise<void> {
+  const list = await update($, agents, prev => {
+    const earlier = prev.find(a => a.id === id)
+    const run = change(earlier)
+    return run && run !== earlier ? [...prev.filter(a => a.id !== id), run].slice(-MAX_AGENTS) : prev
+  })
+  const run = list.find(a => a.id === id)
+  if (!run || !isRunning(run)) return
+  await update($, now, () => at)
+  await autoOpen($, mayOpen)
+}
+
+// A subagent's turn is starting. A loop the engine runs with no agent.spawn,
+// such as a forked skill, gets a row from the engine's list; the engine's own
+// forks (compaction, memory) are on no list and get none. A row that had
+// ended, such as a teammate's woken by a message, runs again.
+async function startAgentTurn($: EngineInterface, id: string, mayOpen: boolean): Promise<void> {
+  const earlier = (await read($, agents)).find(a => a.id === id)
+  if (earlier && isRunning(earlier)) return
+  const info = earlier ? undefined : (await $.agent.list().catch(() => [])).find(one => one.id === id)
+  if (!earlier && !info) return
+  const at = await $.clock.now()
+  await upsertAgent(
+    $,
+    id,
+    a => (a ? (isRunning(a) ? undefined : resumeRun(a, at)) : info && listedAgentRun(info, at)),
+    at,
+    mayOpen,
+  )
+}
+
 const agentColor = (a: AgentRun): string => (isRunning(a) ? ACCENT : a.status === 'done' ? DONE : FAILED)
 
 const agentMark = (a: AgentRun, marks: Glyphs, running: string): string =>
@@ -135,6 +194,8 @@ const stepMark = (step: PlanStep, marks: Glyphs): string =>
 
 export const register: Register = (on, options) => {
   const glyphs = GLYPHS[options.glyphs === 'plain' ? 'plain' : 'nerd']
+
+  const mayOpen = options.autoOpen !== 'never'
 
   on('session.start', async ($, e, next) => {
     const started = await next(e)
@@ -187,8 +248,11 @@ export const register: Register = (on, options) => {
     return started
   })
 
+  // A subagent's row is made or woken before its turn goes on, so its first
+  // request and tool call find it. An error in that bookkeeping never stops the turn.
   on('turn.start', async ($, e, next) => {
-    if (!e.agentId) await update($, isMainTurnRunning, () => true)
+    if (e.agentId) await startAgentTurn($, e.agentId, mayOpen).catch(() => undefined)
+    else await update($, isMainTurnRunning, () => true)
     return next(e)
   })
 
@@ -296,6 +360,37 @@ export const register: Register = (on, options) => {
     return ran
   })
 
+  // A forked skill's row is named for its command. A background one is added
+  // here if its first turn has not been heard yet. A foreground one has ended
+  // by now: its first turn made its row, or, if that went unheard, it is added
+  // here as ended.
+  on('tool.call', { tool: 'Skill' }, async ($, e, next) => {
+    const ran = await next(e)
+    if (ran.deny !== undefined || ran.isError || ran.result?.status !== 'forked' || !ran.result.agentId) return ran
+    const { agentId, commandName, background, success } = ran.result
+    const label = skillLabel(commandName || e.skill, e.args)
+    try {
+      const at = await $.clock.now()
+      await upsertAgent(
+        $,
+        agentId,
+        earlier =>
+          earlier
+            ? namedRun(earlier, SKILL_TYPE, label, '')
+            : !background
+              ? { ...newAgentRun(agentId, SKILL_TYPE, label, '', at), status: success ? 'done' : 'failed', endedAt: at }
+              : success
+                ? newAgentRun(agentId, SKILL_TYPE, label, '', at)
+                : undefined,
+        at,
+        mayOpen,
+      )
+    } catch {
+      // The panel's bookkeeping never fails the call: the skill has already run.
+    }
+    return ran
+  })
+
   // What each worker is doing right now, with nothing asked of the model.
   on('tool.call', async ($, e, next) => {
     const { agentId } = e
@@ -314,21 +409,19 @@ export const register: Register = (on, options) => {
 
     const at = await $.clock.now()
     const id = started.agentId ?? e.tool_use_id
-    await update($, agents, list => {
-      const earlier = list.find(a => a.id === id)
-      const run = earlier ? resumeRun(earlier, at) : newAgentRun(id, e.subagentType, e.description, started.model, at)
-      return [...list.filter(a => a.id !== id), run].slice(-MAX_AGENTS)
-    })
-    await update($, now, () => at)
-
-    if (options.autoOpen !== 'never' && !(await read($, layout)).hasAutoOpened) {
-      try {
-        await $.ui.open({ id: PANE, title: PANE_TITLE })
-        await update($, layout, prev => ({ ...prev, hasAutoOpened: true }))
-      } catch {
-        // Refused this time: the next subagent asks again.
-      }
-    }
+    // A resume runs the row again. A row made from the engine's list takes the
+    // spawn's words; any other keeps its own.
+    await upsertAgent(
+      $,
+      id,
+      earlier => {
+        if (!earlier) return newAgentRun(id, e.subagentType, e.description, started.model, at)
+        const run = e.resume ? resumeRun(earlier, at) : earlier
+        return earlier.fromList ? namedRun(run, e.subagentType, e.description, started.model) : run
+      },
+      at,
+      mayOpen,
+    )
     return started
   })
 

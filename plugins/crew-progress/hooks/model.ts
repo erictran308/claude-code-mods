@@ -1,7 +1,7 @@
 // Everything here is plain data in and plain data out: what the plan and the
 // subagents are, what they cost, and what the band should say about them.
 
-import type { ModelUsage } from 'claude-code'
+import type { AgentInfo, ModelUsage } from 'claude-code'
 
 import type { AgentRun, AgentStatus, Plan, PlanStep, StepStatus } from '../types'
 
@@ -250,6 +250,27 @@ export const newAgentRun = (id: string, type: string, description: string, model
   note: '',
 })
 
+/** A row for an agent loop that no `agent.spawn` announced, such as a forked skill. */
+export const listedAgentRun = (info: Pick<AgentInfo, 'id' | 'type' | 'description' | 'name'>, at: number): AgentRun => ({
+  ...newAgentRun(info.id, info.type || 'agent', info.description || info.name || '', '', at),
+  fromList: true,
+})
+
+/** A row named by what announced it (a spawn, a Skill call): its words, and its model if it had none. */
+export const namedRun = (a: AgentRun, type: string, description: unknown, model: string): AgentRun => ({
+  ...a,
+  fromList: false,
+  type: type || a.type,
+  description: clean(description) || a.description,
+  ...(a.model ? {} : { model, contextMax: contextWindowOf(model) }),
+})
+
+/** A forked skill's row is named for the command as it was called; '' with no name. */
+export const skillLabel = (name: unknown, args: unknown): string => {
+  const command = typeof name === 'string' ? name.trim().replace(/^\/+/, '') : ''
+  return command ? clean(`/${command} ${typeof args === 'string' ? args : ''}`) : ''
+}
+
 /** A run that ended and is working again. Its earlier time is kept and the gap is not. */
 export const resumeRun = (a: AgentRun, at: number): AgentRun =>
   isRunning(a)
@@ -311,7 +332,7 @@ export const viewOfAgent = (a: AgentRun) => {
     ratio: a.status === 'done' ? 1 : a.stepTotal ? a.stepDone / a.stepTotal : percent / 100,
     stepCount: a.stepTotal ? `${a.stepDone}/${a.stepTotal}` : '',
     current: isRunning(a) ? a.note || a.activity : '',
-    meta: [modelName(a.model), a.effort, a.toolCalls ? `${a.toolCalls} ${a.toolCalls === 1 ? 'tool' : 'tools'}` : ''].filter(
+    meta: [a.model ? modelName(a.model) : '', a.effort, a.toolCalls ? `${a.toolCalls} ${a.toolCalls === 1 ? 'tool' : 'tools'}` : ''].filter(
       (part): part is string => Boolean(part),
     ),
   }

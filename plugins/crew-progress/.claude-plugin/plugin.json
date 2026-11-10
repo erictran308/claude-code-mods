@@ -1,6 +1,6 @@
 {
   "name": "crew-progress",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Progress bar above the prompt and a live panel of subagents (/crew). Works in any session: no companion skill, no setup.",
   "author": { "name": "Eric Tran", "url": "https://github.com/erictran308" },
   "homepage": "https://github.com/erictran308/claude-code-mods/tree/main/plugins/crew-progress",

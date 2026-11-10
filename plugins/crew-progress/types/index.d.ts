@@ -43,6 +43,8 @@ export type AgentRun = {
   stepDone: number
   stepTotal: number
   note: string
+  /** Made from the engine's list before any spawn named it, so the spawn's words win. */
+  fromList?: boolean
 }
 
 export type Layout = {

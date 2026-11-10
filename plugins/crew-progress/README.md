@@ -22,7 +22,7 @@ In the desktop app, click + next to the prompt box, then Plugins, Add marketplac
 
 **The bar** appears once there is a plan or a subagent. It shows the job's title, a rounded progress pill with the count inside, the percent, what is happening now, and the number of subagents. The dots ahead of the pill mark work in flight. Press ✕ to hide it; new work brings it back. It clears by itself when you send a new prompt after everything has finished.
 
-**The Crew panel** lists the plan and every subagent: running, finished, failed and stopped. Each row has a small robot colored by agent type, the model and effort, tool calls, what it is doing right now, context used, estimated cost and time. Click a row's title to open that subagent's transcript.
+**The Crew panel** lists the plan and every subagent: running, finished, failed and stopped. Skills that run as their own subagent, such as `/code-review`, appear too, named for the command. Each row has a small robot colored by agent type, the model and effort, tool calls, what it is doing right now, context used, estimated cost and time. Click a row's title to open that subagent's transcript.
 
 ## Using it
 

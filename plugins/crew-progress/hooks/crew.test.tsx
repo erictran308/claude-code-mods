@@ -3,7 +3,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 
 import type { AgentRun } from '../types'
-import { clip, cellWidth, contextWindowOf, costOf, elapsed, newAgentRun, overviewOf, resumeRun, syncTaskList, totals } from './model'
+import { clip, cellWidth, contextWindowOf, costOf, elapsed, newAgentRun, overviewOf, resumeRun, skillLabel, syncTaskList, totals } from './model'
 
 const PLUGIN = 'crew-progress'
 const PROGRESS = 'mcp__crew-progress__progress'
@@ -13,7 +13,7 @@ const T0 = Date.parse('2026-11-09T10:00:00Z')
 const BAND = {
   plugin: PLUGIN,
   component: 'AbovePrompt',
-  props: { hasSurvey: false, isWorking: true, maxRows: 4, bodyColumns: 100, scroll: { offset: 0, bodyRows: 4 }, view: {} },
+  props: { hasSurvey: false, isCollapsed: false, isWorking: true, maxRows: 4, bodyColumns: 100, scroll: { offset: 0, bodyRows: 4 }, view: {} },
 } as const
 
 const PANE = {
@@ -57,8 +57,9 @@ const emptySlot = (on: On) =>
     return <Box />
   })
 
-const spawn = ($: Engine, id: string, description: string) =>
+const spawn = ($: Engine, id: string, description: string, isResume = false) =>
   $.agent.spawn({
+    ...(isResume ? { resume: { agentId: id } } : {}),
     tool_use_id: id,
     prompt: 'p',
     description,
@@ -635,6 +636,242 @@ test('a run whose end went unheard is closed from the engine\'s own list', async
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
 
   expect(await ui.find({ type: 'Text', text: /Running/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+const startTurn = ($: Engine, agentId: string) =>
+  ($.turn.start as (e: unknown) => Promise<unknown>)({ text: '', turnId: 't', agentId })
+
+const listed = (on: On, agents: readonly { id: string; description: string; type: string; name?: string }[]) =>
+  on('agent.list', () => ({ value: agents.map(a => ({ ...a, status: 'running' })) }) as never)
+
+test('a forked skill, which no agent.spawn announces, gets a row from its first turn', async ($, on) => {
+  const model = 'claude-opus-5-5'
+  engine(on, model)
+  on('turn.start', (_, e) => ({ turnId: e.turnId }) as never)
+  on('tool.call', () => ({ result: {} }))
+  listed(on, [{ id: 'f1', description: 'code-review', type: 'general-purpose' }])
+
+  await startTurn($, 'f1')
+  await step($, 'f1', model)
+  await $.tool.call({ tool: 'Read', file_path: '/repo/src/auth.ts', agentId: 'f1' } as never)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /Running · 1/ })).toBeDefined()
+  expect(await ui.find({ type: 'Button', label: 'code-review' } as never)).toBeDefined()
+  expect((await ui.find({ type: 'Text', text: /general-purpose/ }))?.text).toBe('  general-purpose · Opus 5.5 · low · 1 tool')
+  await ui.unmount()
+
+  await finish($, 'f1')
+  const later = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await later.find({ type: 'Text', text: /Running/ })).toBeUndefined()
+  expect(await later.find({ type: 'Button', label: '▾ Finished · 1' } as never)).toBeDefined()
+  await later.unmount()
+})
+
+const forkedSkill = (on: On, success = true) =>
+  on('tool.call', { tool: 'Skill' }, () => ({
+    result: { success, commandName: 'code-review', status: 'forked', agentId: 'f1', result: 'launched', background: true },
+  }) as never)
+
+for (const order of ['Skill call first', 'first turn first'] as const) {
+  test(`a forked skill in the background is named for its command and typed skill (${order})`, async ($, on) => {
+    engine(on, 'claude-opus-5-5')
+    on('turn.start', (_, e) => ({ turnId: e.turnId }) as never)
+    listed(on, [{ id: 'f1', description: 'Review the current diff for bugs', type: 'general-purpose' }])
+    forkedSkill(on)
+
+    const call = () => $.tool.call({ tool: 'Skill', skill: 'code-review', args: 'high --max-findings all' } as never)
+    if (order === 'Skill call first') {
+      await call()
+      await startTurn($, 'f1')
+    } else {
+      await startTurn($, 'f1')
+      await call()
+    }
+
+    const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+    expect(await ui.find({ type: 'Text', text: /Running · 1/ })).toBeDefined()
+    expect(await ui.find({ type: 'Button', label: '/code-review high --max-findings all' } as never)).toBeDefined()
+    expect((await ui.find({ type: 'Text', text: /^ {2}\S/ }))?.text).toBe('  skill')
+    await ui.unmount()
+  })
+}
+
+test('a forked skill that did not launch adds no row', async ($, on) => {
+  engine(on, 'claude-opus-5-5')
+  listed(on, [])
+  forkedSkill(on, false)
+
+  await $.tool.call({ tool: 'Skill', skill: 'code-review' } as never)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /No subagents yet/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a Skill call whose args are not text is named for the command alone', async ($, on) => {
+  engine(on, 'claude-opus-5-5')
+  listed(on, [])
+  forkedSkill(on)
+
+  const ran = await $.tool.call({ tool: 'Skill', skill: 'code-review', args: { level: 'high' } } as never)
+
+  expect(ran).toMatchObject({ result: { agentId: 'f1' } })
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Button', label: '/code-review' } as never)).toBeDefined()
+  await ui.unmount()
+})
+
+test('an agent first heard at the end of its turn gets no row and opens no pane', async ($, on) => {
+  let opens = 0
+  engine(on, 'claude-haiku-5-5', USAGE, () => {
+    opens++
+    return { value: { isPlaced: true } }
+  })
+  listed(on, [{ id: 'f1', description: 'code-review', type: 'general-purpose' }])
+
+  await step($, 'f1', 'claude-haiku-5-5')
+  await finish($, 'f1')
+
+  expect(opens).toBe(0)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /No subagents yet/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a subagent whose end went unheard keeps its words when it is spawned again', async ($, on) => {
+  engine(on, 'claude-haiku-5-5')
+  await spawn($, 'a1', 'Map the auth flow')
+  await step($, 'a1', 'claude-haiku-5-5')
+  await spawn($, 'a1', 'Continue')
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Button', label: 'Map the auth flow' } as never)).toBeDefined()
+  await ui.unmount()
+})
+
+test('a spawned subagent with no request yet keeps its words when it is spawned again', async ($, on) => {
+  engine(on, 'claude-haiku-5-5')
+  await spawn($, 'a1', 'Map the auth flow')
+  await spawn($, 'a1', 'Continue')
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Button', label: 'Map the auth flow' } as never)).toBeDefined()
+  await ui.unmount()
+})
+
+test('a teammate woken after its turn ended shows as running from its turn start', async ($, on) => {
+  engine(on, 'claude-haiku-5-5')
+  on('turn.start', (_, e) => ({ turnId: e.turnId }) as never)
+  await spawn($, 'a1', 'Teammate')
+  await finish($, 'a1')
+  await startTurn($, 'a1')
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /Running · 1/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a spawn that is no resume names a listed row whose turn already ended, and leaves it ended', async ($, on) => {
+  engine(on, 'claude-haiku-5-5')
+  on('turn.start', (_, e) => ({ turnId: e.turnId }) as never)
+  listed(on, [{ id: 'a1', description: '', type: '' }])
+  await startTurn($, 'a1')
+  await finish($, 'a1')
+  await spawn($, 'a1', 'Quick job')
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /Running/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', label: 'Quick job' } as never)).toBeDefined()
+  await ui.unmount()
+})
+
+test('a foreground forked skill whose turns went unheard is added as finished', async ($, on) => {
+  let opens = 0
+  engine(on, 'claude-opus-5-5', USAGE, () => (opens++, { value: { isPlaced: true } }))
+  on('tool.call', { tool: 'Skill' }, () => ({
+    result: { success: true, commandName: 'code-review', status: 'forked', agentId: 'f1', result: 'No issues.' },
+  }) as never)
+
+  await $.tool.call({ tool: 'Skill', skill: 'code-review', args: 'high' } as never)
+
+  expect(opens).toBe(0)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /Running/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', label: '▾ Finished · 1' } as never)).toBeDefined()
+  expect(await ui.find({ type: 'Button', label: '/code-review high' } as never)).toBeDefined()
+  await ui.unmount()
+})
+
+test('a spawn that changes nothing leaves the rows in their order', async ($, on) => {
+  engine(on, 'claude-haiku-5-5')
+  await spawn($, 'a1', 'First')
+  await spawn($, 'a2', 'Second')
+  await spawn($, 'a1', 'First again')
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const labels = (await ui.findAll({ type: 'Button' } as never)).map(b => (b as unknown as { props: { label: string } }).props.label)
+  expect(labels.indexOf('Second')).toBeLessThan(labels.indexOf('First'))
+  await ui.unmount()
+})
+
+test('a Skill result with no result object passes through untouched', async ($, on) => {
+  engine(on, 'claude-opus-5-5')
+  on('tool.call', { tool: 'Skill' }, () => ({ result: undefined }) as never)
+
+  const ran = await $.tool.call({ tool: 'Skill', skill: 'code-review' } as never)
+
+  expect(ran).toMatchObject({ result: undefined })
+})
+
+test('a skill label has one slash, and none without a name', () => {
+  expect(skillLabel('code-review', 'high')).toBe('/code-review high')
+  expect(skillLabel('/code-review', '  ')).toBe('/code-review')
+  expect(skillLabel('', 'high')).toBe('')
+  expect(skillLabel(undefined, { level: 'high' })).toBe('')
+})
+
+test('a resumed subagent keeps the words its row had', async ($, on) => {
+  engine(on, 'claude-haiku-5-5')
+  await spawn($, 'a1', 'Map the auth flow')
+  await finish($, 'a1')
+  await spawn($, 'a1', 'Continue', true)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /Running · 1/ })).toBeDefined()
+  expect(await ui.find({ type: 'Button', label: 'Map the auth flow' } as never)).toBeDefined()
+  await ui.unmount()
+})
+
+test("the engine's own forks, on no list, get no row", async ($, on) => {
+  const model = 'claude-haiku-5-5'
+  engine(on, model)
+  on('turn.start', (_, e) => ({ turnId: e.turnId }) as never)
+  listed(on, [])
+
+  await startTurn($, 'compact-1')
+  await step($, 'compact-1', model)
+  await finish($, 'compact-1')
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /No subagents yet/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a subagent whose first turn is heard before its spawn answers keeps one row, named by the spawn', async ($, on) => {
+  engine(on, 'claude-haiku-5-5')
+  on('turn.start', (_, e) => ({ turnId: e.turnId }) as never)
+  // The engine's list may not have the words yet, only a handle of its own.
+  listed(on, [{ id: 'a1', description: '', type: '', name: 'agent-7f' }])
+
+  await startTurn($, 'a1')
+  await spawn($, 'a1', 'Map the auth flow')
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /Running · 1/ })).toBeDefined()
+  expect(await ui.find({ type: 'Button', label: 'Map the auth flow' } as never)).toBeDefined()
+  expect((await ui.find({ type: 'Text', text: /Explore/ }))?.text).toBe('  Explore · Haiku 5.5')
   await ui.unmount()
 })
 

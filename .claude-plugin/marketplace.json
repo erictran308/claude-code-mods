@@ -7,7 +7,7 @@
       "name": "crew-progress",
       "source": "./plugins/crew-progress",
       "description": "Progress bar above the prompt and a live panel of subagents. Works in any session, with no setup.",
-      "version": "0.1.0",
+      "version": "0.1.1",
       "category": "mod"
     },
     {
