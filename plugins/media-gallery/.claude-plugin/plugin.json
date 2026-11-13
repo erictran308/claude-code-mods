@@ -1,0 +1,19 @@
+{
+  "name": "media-gallery",
+  "version": "0.1.0",
+  "description": "Pictures and videos in the chat: a thumbnail strip under the call, a gallery pane you drive with h j k l, Enter to view, f for fullscreen in Pepper.",
+  "author": { "name": "Eric Tran", "url": "https://github.com/erictran308" },
+  "homepage": "https://github.com/erictran308/claude-code-mods/tree/main/plugins/media-gallery",
+  "repository": "https://github.com/erictran308/claude-code-mods",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "takeKeys": {
+      "type": "string",
+      "title": "Gallery takes the keys",
+      "description": "when-you-open-it: the pane takes the keyboard only when you open it (/gallery or a click). always: also when Claude shows something (your typing then goes to the gallery).",
+      "default": "when-you-open-it",
+      "options": ["when-you-open-it", "always"]
+    }
+  },
+  "license": "MIT"
+}

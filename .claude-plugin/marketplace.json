@@ -16,6 +16,13 @@
       "description": "A live file tree beside the chat that lights up the files Claude reads, edits and commits.",
       "version": "0.2.1",
       "category": "mod"
+    },
+    {
+      "name": "media-gallery",
+      "source": "./plugins/media-gallery",
+      "description": "Pictures and videos in the chat: thumbnails under the call, a gallery pane driven by h j k l, Enter to view, f for fullscreen in Pepper.",
+      "version": "0.1.0",
+      "category": "mod"
     }
   ]
 }
