@@ -50,6 +50,8 @@ export type GitView = {
   ahead: number
   behind: number
   head: string
+  /** False when the last looks could not read where HEAD stands: an empty `head` is then no answer, not "no commits yet". */
+  isHeadKnown: boolean
   /** At most a few thousand are kept: `changedTotal` is how many there are. */
   changes: Record<string, Change>
   changedTotal: number
@@ -63,6 +65,8 @@ export type GitView = {
 export type Layout = {
   /** The session's folder: Back to project returns here. */
   project: string
+  /** The folder Claude Code started in, which a shell `cd` never moves: where an MCP server reads relative paths from. */
+  startFolder?: string
   root: string
   expanded: string[]
   /** Folders opened to show Claude's work, with when: these close themselves. */

@@ -14,7 +14,7 @@
       "name": "file-tree",
       "source": "./plugins/file-tree",
       "description": "A live file tree beside the chat that lights up the files Claude reads, edits and commits.",
-      "version": "0.2.0",
+      "version": "0.2.1",
       "category": "mod"
     }
   ]

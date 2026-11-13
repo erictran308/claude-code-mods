@@ -25,7 +25,6 @@ import {
   applyTouches,
   basename,
   buildRows,
-  buildTouchedRows,
   cellWidth,
   clip,
   commitsSince,
@@ -34,16 +33,21 @@ import {
   findFiles,
   folderMarks,
   foldersToClose,
+  foldsOfAll,
   foldersToOpen,
   formatSize,
   formatWhen,
+  headAfter,
   iconOf,
   imagePlanOf,
+  plural,
+  rememberLast,
   isInside,
   isTopFolder,
   join,
   listingOf,
   mentionPath,
+  needsTmuxAnswer,
   parseIconMap,
   parseNames,
   parseNumstat,
@@ -57,9 +61,14 @@ import {
   sameListing,
   shownPath,
   summaryOf,
+  toggleFold,
+  touchedFilesIn,
+  touchedRowsOf,
+  touchedTreeOf,
   visibleFolders,
   withClosed,
   withPinned,
+  wholeRecords,
   withTreeSetting,
   workingKinds,
 } from './model'
@@ -109,6 +118,7 @@ const LABELS: Record<TouchKind, string> = { read: 'read', edited: 'edited', comm
 
 const initialLayout = (project = '', treeView: TreeView = 'touched'): Layout => ({
   project,
+  startFolder: project,
   root: project,
   expanded: [],
   autoOpened: {},
@@ -128,7 +138,7 @@ const initialActivity = (): Activity => ({ turn: 0, isWorking: false, working: [
 // outlives a reload, and the tag makes the new code decline it.
 const layout = atom({ plugin: 'file-tree', key: 'layout' } as const, initialLayout(), { shape: 'layout-3' })
 const listings = atom({ plugin: 'file-tree', key: 'listings' } as const, {}, { shape: 'listings-1' })
-const gitView = atom({ plugin: 'file-tree', key: 'git' } as const, NO_GIT, { shape: 'git-2' })
+const gitView = atom({ plugin: 'file-tree', key: 'git' } as const, NO_GIT, { shape: 'git-3' })
 const touches = atom({ plugin: 'file-tree', key: 'touches' } as const, [], { shape: 'touches-2' })
 const activity = atom({ plugin: 'file-tree', key: 'activity' } as const, initialActivity(), { shape: 'activity-2' })
 const now = atom({ plugin: 'file-tree', key: 'now' } as const, 0)
@@ -146,15 +156,61 @@ let pendingSince: number | null = null
 let isScanQueued = false
 let gitSync: Promise<void> | null = null
 let gitSyncQueued: Promise<void> | null = null
+/**
+ * The span of the shell and MCP calls that may have written and committed files. Whichever git look
+ * first finds their commits credits Claude only with the committed files that changed inside it, so a
+ * poll that sees the commit mid-call loses nothing and the person's own later work is never credited.
+ * Calls that overlap share one span; `running` counts those not yet answered.
+ */
+let credit: { start: number; end: number; running: number } | null = null
+/** File times can be a second coarse, and a call's last writes land just before it answers. */
+const CREDIT_SLACK_MS = 5_000
+/** A span no git look used this long after its calls ended (the pane was closed) credits nothing. */
+const CREDIT_TTL_MS = 120_000
+
+const openCredit = (at: number): void => {
+  credit = credit === null ? { start: at, end: at, running: 1 } : { start: Math.min(credit.start, at), end: Math.max(credit.end, at), running: credit.running + 1 }
+}
+
+const closeCredit = (at: number): void => {
+  if (credit !== null) credit = { ...credit, end: Math.max(credit.end, at), running: Math.max(0, credit.running - 1) }
+}
+
+/** The times a git look at `at` may credit, or null: a span long ended is dropped. */
+const creditSpan = (at: number): { from: number; to: number } | null => {
+  if (credit !== null && credit.running === 0 && at - credit.end > CREDIT_TTL_MS) credit = null
+  return credit === null ? null : { from: credit.start, to: (credit.running > 0 ? at : credit.end) + CREDIT_SLACK_MS }
+}
 let findIndex: { root: string; paths: string[]; at: number } | null = null
+/** The find index of the folder `root`, if one was built: another folder's would find files outside it. */
+const indexFor = (root: string): string[] | null => (findIndex?.root === root ? findIndex.paths : null)
 let indexing: { root: string; done: Promise<void> } | null = null
 const lineCounts = new Map<string, { mtimeMs: number; lines: number }>()
+/** Tool calls another plugin makes may carry no id: each gets one of its own, so two at once stay apart, across reloads too. */
+const IDLESS_RUN = Math.random().toString(16).slice(2, 10)
+let idlessCalls = 0
+/** A row Find or a click is bringing into view: drawn even outside the window, so the scroll finds it. */
+let revealing = ''
+/** The tree's own folder, when the last look found it gone. */
+let goneRoot = ''
 let iconMap: IconMap | null = null
 let imagePlan: ImagePlan | null = null
 let iconsDir = ''
 const iconBytes = new Map<string, string>()
+/** Icons whose file is missing or damaged: their rows keep chips, and the file is not read again. */
+const iconsMissing = new Set<string>()
 
 const rowKey = (path: string): string => `row:${path}`
+
+// The tick redraws the pane every 160 ms while anything is lit: these answer again only when their inputs change.
+const NO_PATHS: readonly string[] = []
+const foundFor = rememberLast((paths: readonly string[], query: string) => findFiles(paths, query))
+const marksFor = rememberLast(folderMarks)
+
+/** The git view of the folder `root`: one of another folder (a look at this one failed) says nothing about it. */
+const viewFor = (view: GitView, root: string): GitView => (view.root === root ? view : { ...NO_GIT, root })
+
+const gitFor = async ($: EngineInterface, root: string): Promise<GitView> => viewFor(await read($, gitView), root)
 
 const quietly = async (work: () => Promise<unknown>): Promise<void> => {
   try {
@@ -191,19 +247,27 @@ async function countUntracked($: EngineInterface, changes: Record<string, Change
       }
     }),
   )
+  // Files no longer changed (committed, deleted, ignored) leave the cache, so it stays the size of the work.
+  for (const path of lineCounts.keys()) if (!(path in changes)) lineCounts.delete(path)
   return isComplete
 }
 
 const readGitStamp = async ($: EngineInterface, gitDir: string): Promise<string> => {
-  const times = await Promise.all(['index', 'HEAD'].map(name => $.fs.stat(join(gitDir, name)).then(s => s.mtimeMs, () => 0)))
+  // HEAD names a branch and does not change when the branch moves; its log does, for a commit, a reset or a fetch.
+  const times = await Promise.all(['index', 'HEAD', 'logs/HEAD'].map(name => $.fs.stat(join(gitDir, name)).then(s => s.mtimeMs, () => 0)))
   return times.join(':')
 }
 
-/** Null when git could not answer this time: the last answer stands. */
-async function readGit($: EngineInterface, root: string): Promise<GitView | null> {
+/**
+ * Null when git could not answer this time (a timeout rejects the run, so the whole
+ * look fails): the view before it stands. `last` is that view, for this folder: a
+ * `git log` that exits with an error keeps its head; with none known, the head is unknown.
+ */
+async function readGit($: EngineInterface, root: string, last: GitView | null): Promise<GitView | null> {
   try {
     const where = await runGit($, root, ['rev-parse', '--show-toplevel', '--show-prefix', '--absolute-git-dir'])
-    if (where.exitCode !== 0) return /not a git repository/i.test(where.stderr) ? { ...NO_GIT, root } : null
+    // A folder git says is no repository has no commits, which is known: a `git init` and first commit then count.
+    if (where.exitCode !== 0) return /not a git repository/i.test(where.stderr) ? { ...NO_GIT, root, isHeadKnown: true } : null
     const [top = '', prefix = '', gitDir = ''] = where.stdout.split('\n')
     // Taken before the status: a commit landing between the two shows up at the next look.
     const stamp = await readGitStamp($, gitDir)
@@ -215,7 +279,8 @@ async function readGit($: EngineInterface, root: string): Promise<GitView | null
       runGit($, root, ['log', '-1', '--format=%h']),
     ])
     if (status.exitCode !== 0) return null
-    const parsed = parseStatus(status.stdout, toPath)
+    // Past its size limit the stream is cut mid-record: the cut one is dropped, and the counts say they are a floor.
+    const parsed = parseStatus(wholeRecords(status.stdout, status.isStdoutTruncated), toPath)
     const changes = { ...parsed.changes }
     if (numstat.exitCode === 0) {
       for (const [path, [added, removed]] of parseNumstat(numstat.stdout, toPath)) {
@@ -233,11 +298,11 @@ async function readGit($: EngineInterface, root: string): Promise<GitView | null
       prefix,
       gitDir,
       stamp,
-      head: head.exitCode === 0 ? head.stdout.trim() : '',
+      ...headAfter(head, last),
       changes,
       added: all.reduce((sum, change) => sum + change.added, 0),
       removed: all.reduce((sum, change) => sum + change.removed, 0),
-      isCountPartial: !isCounted || parsed.changedTotal > all.length,
+      isCountPartial: !isCounted || parsed.changedTotal > all.length || status.isStdoutTruncated,
     }
   } catch {
     return null
@@ -263,12 +328,50 @@ async function listFolder($: EngineInterface, dir: string): Promise<Listing | nu
   }
 }
 
+/** What a failed look at a folder means: only "no such file" says it is gone. */
+const isMissing = (error: unknown): boolean => {
+  const code = typeof error === 'object' && error !== null ? (error as { code?: unknown }).code : undefined
+  return code === 'ENOENT' || /ENOENT|no such file/i.test(error instanceof Error ? error.message : String(error))
+}
+
+/** Gone: no longer there, or no longer a folder. A failure that says neither (no permission) leaves it be. */
+async function isFolderGone($: EngineInterface, dir: string): Promise<boolean> {
+  try {
+    return (await $.fs.stat(dir)).kind !== 'dir'
+  } catch (error) {
+    return isMissing(error)
+  }
+}
+
 /** Says whether anything in the tree changed. */
 async function refreshListings($: EngineInterface): Promise<boolean> {
   const asked = await read($, layout)
   if (!asked.root) return false
   const foldersOf = (at: Layout): string[] => [at.root, ...visibleFolders(at).slice(-MAX_OPEN_FOLDERS)]
   const listed = new Map(await Promise.all(foldersOf(asked).map(async dir => [dir, await listFolder($, dir)] as const)))
+  // A folder that could not be listed keeps its last listing through a passing failure,
+  // but one that is gone drops it, so the tree stops showing what is no longer there.
+  const unlisted = [...listed].filter(([, listing]) => listing === null).map(([dir]) => dir)
+  const gone = new Set((await Promise.all(unlisted.map(async dir => ((await isFolderGone($, dir)) ? dir : '')))).filter(Boolean))
+  const wasGone = goneRoot
+  if (gone.has(asked.root)) goneRoot = asked.root
+  else if (listed.get(asked.root)) goneRoot = ''
+  // The tree may hold nothing that changes with it, so the pane is asked to draw the news itself.
+  if (goneRoot !== wasGone) {
+    try {
+      $.ui.invalidate('ui.render')
+    } catch {
+      // Drawn at the next change instead.
+    }
+  }
+  // A gone folder is no longer open either, so it is not looked for again at every poll.
+  if (gone.size > 0) {
+    await update($, layout, prev => {
+      const next = withClosed(prev, [...gone])
+      const isSame = next.expanded.length === prev.expanded.length && Object.keys(next.autoOpened).length === Object.keys(prev.autoOpened).length
+      return isSame ? prev : next
+    })
+  }
   // The person may have opened or closed something meanwhile: what is wanted now decides.
   const wanted = foldersOf(await read($, layout))
   let didChange = false
@@ -276,7 +379,7 @@ async function refreshListings($: EngineInterface): Promise<boolean> {
     const fresh: Record<string, Listing> = {}
     let isSame = Object.keys(prev).length === wanted.length
     for (const dir of wanted) {
-      const kept = listed.get(dir) ?? prev[dir]
+      const kept = gone.has(dir) ? undefined : (listed.get(dir) ?? prev[dir])
       if (kept) fresh[dir] = kept
       if (!sameListing(kept, prev[dir])) isSame = false
     }
@@ -291,13 +394,15 @@ async function followCwd($: EngineInterface): Promise<void> {
   await update($, layout, prev => {
     // A `cd` into a subfolder moves Claude, not the project this tree is showing.
     if (isInside(prev.project, cwd)) return prev
-    return prev.root === prev.project
-      ? { ...prev, project: cwd, root: cwd, expanded: [], autoOpened: {}, query: '' }
-      : { ...prev, project: cwd }
+    return prev.root === prev.project ? { ...prev, project: cwd, root: cwd, expanded: [], autoOpened: {}, query: '' } : { ...prev, project: cwd }
   })
 }
 
-async function noteCommits($: EngineInterface, root: string, before: GitView, view: GitView): Promise<void> {
+/**
+ * `span` is when the tool calls that may have made these commits ran, if any did: a file
+ * one wrote and committed in one go was never seen edited, but its date says so.
+ */
+async function noteCommits($: EngineInterface, root: string, before: GitView, view: GitView, span: { from: number; to: number } | null): Promise<void> {
   const log = await runGit($, root, ['reflog', '-n', String(MAX_REFLOG), '--format=%H%x00%gs', 'HEAD']).catch(() => null)
   if (log?.exitCode !== 0) return
   const commits = commitsSince(parseReflog(log.stdout), before.head)
@@ -305,23 +410,42 @@ async function noteCommits($: EngineInterface, root: string, before: GitView, vi
   const shown = await runGit($, root, ['show', '--name-only', '--no-renames', '-z', '--format=', ...commits.slice(0, MAX_COMMITS_READ)]).catch(() => null)
   if (shown?.exitCode !== 0) return
   const inCommits = new Set(parseNames(shown.stdout, pathMapper(root, view.top, view.prefix)))
-  const edited = (await read($, touches)).filter(touch => touch.kind === 'edited' && inCommits.has(touch.path)).map(touch => touch.path)
-  if (edited.length === 0) return // Someone else's commit, of nothing Claude changed.
+  const list = await read($, touches)
+  const edited = list.filter(touch => touch.kind === 'edited' && inCommits.has(touch.path)).map(touch => touch.path)
+  const seen = new Set(edited)
+  let written: string[] = []
+  if (span !== null) {
+    const unseen = [...inCommits].filter(path => !seen.has(path)).slice(0, MAX_DIRTY_STATS)
+    const stats = await Promise.all(
+      unseen.map(path => $.fs.stat(path).then(stat => (stat.kind === 'file' ? { path, mtimeMs: stat.mtimeMs } : null), () => null)),
+    )
+    const inside = stats.filter((stat): stat is { path: string; mtimeMs: number } => stat !== null && stat.mtimeMs <= span.to)
+    written = pickChanged(inside, span.from, list)
+    // Used once its calls have ended: a later commit is the person's.
+    if (credit !== null && credit.running === 0) credit = null
+  }
+  const committed = [...edited, ...written]
+  if (committed.length === 0) return // Someone else's commit, of nothing Claude changed.
   const at = await $.clock.now()
-  const act = await update($, activity, prev => ({ ...appendTrail(prev, 'committed', edited.length), commitSha: view.head }))
-  await update($, touches, list => applyTouches(list, edited, 'committed', at, act.turn))
+  const act = await update($, activity, prev => ({ ...appendTrail(prev, 'committed', committed.length), commitSha: view.head }))
+  await update($, touches, touchList => applyTouches(touchList, committed, 'committed', at, act.turn))
   await update($, now, () => at)
 }
 
 async function readAndNoteGit($: EngineInterface): Promise<void> {
+  // When the tool calls this look may credit ran.
+  const span = creditSpan(await $.clock.now())
   const { root } = await read($, layout)
   if (!root) return
-  const view = await readGit($, root)
+  const before = await read($, gitView)
+  const view = await readGit($, root, before.root === root ? before : null)
   // A slow answer for a folder the tree has since left is no use.
   if (!view || (await read($, layout)).root !== root) return
-  const before = await read($, gitView)
   await update($, gitView, prev => (sameGitView(prev, view) ? prev : view))
-  if (before.root === root && view.head && before.head !== view.head) await noteCommits($, root, before, view)
+  // Only a head known before and now can tell which commits are new.
+  if (before.root === root && before.isHeadKnown && view.isHeadKnown && view.head && before.head !== view.head) {
+    await noteCommits($, root, before, view, span)
+  }
 }
 
 /** One look at a time, and at most one more waiting behind it. */
@@ -341,7 +465,7 @@ function syncGit($: EngineInterface): Promise<void> {
 
 /** Files a shell or MCP call changed without naming them, found by their dates. */
 async function attributeChanges($: EngineInterface, since: number): Promise<void> {
-  const view = await read($, gitView)
+  const view = await gitFor($, (await read($, layout)).root)
   let candidates: { path: string; mtimeMs: number }[] = []
   if (view.isRepo) {
     const dirty = Object.entries(view.changes)
@@ -411,7 +535,7 @@ const followRow = ($: EngineInterface, path: string): void => {
 /** `autoAt` is when, for folders opened to show Claude's work; null when the person asked. */
 async function openFoldersFor($: EngineInterface, paths: readonly string[], autoAt: number | null): Promise<void> {
   const current = await read($, layout)
-  const ignored = new Set((await read($, gitView)).ignored)
+  const ignored = new Set((await gitFor($, current.root)).ignored)
   const opening = foldersToOpen(current, paths, ignored, autoAt === null)
   if (opening.length === 0) return
   await update($, layout, prev => ({
@@ -484,8 +608,9 @@ async function ensureIndex($: EngineInterface): Promise<void> {
   if (findIndex?.root === root && at - findIndex.at < INDEX_FRESH_MS) return
   if (indexing?.root === root) return indexing.done
   const build = async (): Promise<void> => {
-    const { isRepo } = await read($, gitView)
-    const paths = await buildIndex($, root, isRepo)
+    const { isRepo } = await gitFor($, root)
+    // A build that fails leaves an empty index, so Find says nothing matches rather than searching for ever.
+    const paths = await buildIndex($, root, isRepo).catch((): string[] => [])
     if ((await read($, layout)).root !== root) return
     findIndex = { root, paths, at }
     await update($, now, () => at)
@@ -503,7 +628,14 @@ async function ensureIndex($: EngineInterface): Promise<void> {
 async function poll($: EngineInterface, isFull: boolean): Promise<void> {
   if (!(await checkPane($))) return
   const didChange = await refreshListings($)
+  const { root } = await read($, layout)
   const view = await read($, gitView)
+  // A view of another folder (the last look at this one failed) is no view of it: look again on the
+  // full sync or a change in the listings, as for any other folder, not at every poll.
+  if (view.root !== root) {
+    if (isFull || didChange) await syncGit($)
+    return
+  }
   const stamp = view.isRepo ? await readGitStamp($, view.gitDir) : ''
   if (isFull || didChange || stamp !== view.stamp) await syncGit($)
 }
@@ -515,26 +647,25 @@ const askTmux = async ($: EngineInterface, pane: string): Promise<string | undef
 }
 
 async function loadIcons($: EngineInterface, setting: unknown): Promise<void> {
-  const tmux = await $.env.get('TMUX')
-  const tmuxPane = await $.env.get('TMUX_PANE')
-  const tmuxAnswer = tmux && tmuxPane && setting !== 'chips' ? await askTmux($, tmuxPane) : undefined
   // Each name written out: the engine lists what a mod reads from the source.
-  imagePlan = imagePlanOf(
-    setting,
-    {
-      TERM: await $.env.get('TERM'),
-      TERM_PROGRAM: await $.env.get('TERM_PROGRAM'),
-      TERM_PROGRAM_VERSION: await $.env.get('TERM_PROGRAM_VERSION'),
-      TMUX: tmux,
-      SSH_CONNECTION: await $.env.get('SSH_CONNECTION'),
-      SSH_TTY: await $.env.get('SSH_TTY'),
-      KITTY_WINDOW_ID: await $.env.get('KITTY_WINDOW_ID'),
-      ZELLIJ: await $.env.get('ZELLIJ'),
-      STY: await $.env.get('STY'),
-      CLAUDE_CODE_FORCE_TERMINAL_IMAGES: await $.env.get('CLAUDE_CODE_FORCE_TERMINAL_IMAGES'),
-    },
-    tmuxAnswer,
-  )
+  const [TERM, TERM_PROGRAM, TERM_PROGRAM_VERSION, TMUX, TMUX_PANE, SSH_CONNECTION, SSH_TTY, KITTY_WINDOW_ID, ZELLIJ, STY, FORCE] =
+    await Promise.all([
+      $.env.get('TERM'),
+      $.env.get('TERM_PROGRAM'),
+      $.env.get('TERM_PROGRAM_VERSION'),
+      $.env.get('TMUX'),
+      $.env.get('TMUX_PANE'),
+      $.env.get('SSH_CONNECTION'),
+      $.env.get('SSH_TTY'),
+      $.env.get('KITTY_WINDOW_ID'),
+      $.env.get('ZELLIJ'),
+      $.env.get('STY'),
+      $.env.get('CLAUDE_CODE_FORCE_TERMINAL_IMAGES'),
+    ])
+  const env = { TERM, TERM_PROGRAM, TERM_PROGRAM_VERSION, TMUX, SSH_CONNECTION, SSH_TTY, KITTY_WINDOW_ID, ZELLIJ, STY, CLAUDE_CODE_FORCE_TERMINAL_IMAGES: FORCE }
+  // tmux is asked only when its answer decides: not for chips, not when told to try regardless, not inside another multiplexer.
+  const tmuxAnswer = TMUX_PANE && needsTmuxAnswer(setting, env) ? await askTmux($, TMUX_PANE) : undefined
+  imagePlan = imagePlanOf(setting, env, tmuxAnswer)
   if (!imagePlan) return
   iconsDir = `${$.plugin.root}/assets/icons`
   iconMap = parseIconMap(await $.fs.read(`${iconsDir}/map.json`))
@@ -545,14 +676,18 @@ async function loadIcons($: EngineInterface, setting: unknown): Promise<void> {
 async function loadIconBytes($: EngineInterface, icons: ReadonlySet<string>): Promise<void> {
   await Promise.all(
     [...icons]
-      .filter(icon => !iconBytes.has(icon))
-      .map(icon =>
-        quietly(async () => {
+      .filter(icon => !iconBytes.has(icon) && !iconsMissing.has(icon))
+      .map(async icon => {
+        try {
           const { base64 } = await $.fs.read(`${iconsDir}/${icon}.png`, { as: 'bytes' })
           // The engine refuses a whole drawing over one bad picture; a damaged icon costs only its row.
           if (base64.startsWith(PNG_START)) iconBytes.set(icon, base64)
-        }),
-      ),
+          else iconsMissing.add(icon)
+        } catch {
+          // Missing: not looked for again at every frame.
+          iconsMissing.add(icon)
+        }
+      }),
   )
 }
 
@@ -588,7 +723,6 @@ async function togglePane($: EngineInterface): Promise<PaneAnswer> {
 }
 
 async function changeRoot($: EngineInterface, root: string): Promise<void> {
-  findIndex = null
   await update($, layout, prev => ({ ...prev, root, expanded: [], autoOpened: {}, query: '' }))
   await refreshListings($)
   await syncGit($)
@@ -601,6 +735,8 @@ async function showFile($: EngineInterface, path: string): Promise<void> {
     $.ui.toast(`${shownPath(root, path, home)} is outside this tree.`)
     return
   }
+  // A long tree draws only the rows near the view: the row to scroll to is drawn too, until the scroll is done.
+  revealing = path
   // A file Claude has not handled is only in the whole tree.
   const isTouched = (await read($, touches)).some(touch => touch.path === path)
   await update($, layout, prev => ({
@@ -610,17 +746,20 @@ async function showFile($: EngineInterface, path: string): Promise<void> {
     touchedClosed: prev.touchedClosed.filter(dir => !isInside(dir, path)),
   }))
   await openFoldersFor($, [path], null)
+  $.ui.invalidate('ui.render')
   $.clock.after(FOLLOW_DELAY_MS, () => {
-    void $.ui.scroll({ in: PANE, to: { key: rowKey(path) }, block: 'center' }).catch(() => undefined)
+    void $.ui
+      .scroll({ in: PANE, to: { key: rowKey(path) }, block: 'center' })
+      .catch(() => undefined)
+      .finally(() => {
+        if (revealing === path) revealing = ''
+      })
   })
 }
 
 async function toggleFolder($: EngineInterface, path: string): Promise<void> {
   if ((await read($, layout)).touchedOnly) {
-    await update($, layout, prev => ({
-      ...prev,
-      touchedClosed: prev.touchedClosed.includes(path) ? prev.touchedClosed.filter(dir => dir !== path) : [...prev.touchedClosed, path],
-    }))
+    await update($, layout, prev => ({ ...prev, touchedClosed: toggleFold(prev.touchedClosed, path, prev.root) }))
     return
   }
   const isOpen = (await read($, layout)).expanded.includes(path) && (await read($, listings))[path] !== undefined
@@ -640,6 +779,8 @@ async function mentionFile($: EngineInterface, path: string): Promise<void> {
 }
 
 async function pressRow($: EngineInterface, action: HitAction | undefined, path: string): Promise<void> {
+  // A new press moves on from a row still being revealed.
+  revealing = ''
   if (action === 'toggle') await toggleFolder($, path)
   else if (action === 'mention') await mentionFile($, path)
   else if (action === 'show') await showFile($, path)
@@ -661,7 +802,13 @@ export const register: Register = (on, options) => {
     home = posix((await $.env.get('HOME')) ?? '')
     const cwd = posix(await $.session.cwd())
     const treeView: TreeView = options.treeView === 'all' ? 'all' : 'touched'
-    await update($, layout, prev => (prev.project ? withTreeSetting(prev, treeView) : initialLayout(cwd, treeView)))
+    // A layout kept from before it knew where Claude Code started: the session's root, which a shell `cd` does
+    // not move as it moves the cwd, stands in for that folder.
+    const stored = await read($, layout)
+    const start = stored.project && !stored.startFolder ? await $.session.root().then(posix, () => cwd) : cwd
+    await update($, layout, prev =>
+      prev.project ? withTreeSetting({ ...prev, startFolder: prev.startFolder || start }, treeView) : initialLayout(cwd, treeView),
+    )
     await quietly(() => loadIcons($, options.icons))
     // A search kept through a reload has lost its index, which lives only in memory.
     if ((await read($, layout)).query) await quietly(() => ensureIndex($))
@@ -724,13 +871,19 @@ export const register: Register = (on, options) => {
   // A fault in this bookkeeping must never reach the tool, so all of it is `quietly`.
   on('tool.call', async ($, e, next) => {
     if (!isWatching) return next(e)
-    const id = e.tool_use_id
+    const id = e.tool_use_id || `idless-${IDLESS_RUN}-${++idlessCalls}`
     let plan: Planned = { reads: [], writes: [], mayWrite: false }
     let startedAt = 0
     await quietly(async () => {
-      const tool: string = e.tool
-      plan = planOfTool(tool, e as unknown as Record<string, unknown>, posix(await $.session.cwd()), home)
+      // Taken first: a failure further on must not leave the start at 0, which would credit every dirty file.
       startedAt = await $.clock.now()
+      const tool: string = e.tool
+      // An MCP server reads a relative path from the folder Claude Code started in, not from where a shell `cd`
+      // went (which can also move the project); only those calls read it.
+      const isMcp = tool.startsWith('mcp__')
+      const [here, start] = await Promise.all([$.session.cwd(), isMcp ? read($, layout).then(at => at.startFolder || at.project) : ''])
+      const cwd = posix(here)
+      plan = planOfTool(tool, e as unknown as Record<string, unknown>, cwd, home, isMcp && start ? start : cwd)
       const named = [...plan.writes, ...plan.reads]
       if (named.length === 0) return
       const kind: TouchKind = plan.writes.length > 0 ? 'edited' : 'read'
@@ -739,19 +892,23 @@ export const register: Register = (on, options) => {
     })
     const isNamed = plan.reads.length + plan.writes.length > 0
     if (!isNamed && !plan.mayWrite) return next(e)
+    // A call that may write is the span whose commits can be credited to Claude.
+    const isCrediting = plan.mayWrite && startedAt > 0
+    if (isCrediting) openCredit(startedAt)
 
     let result: Awaited<ReturnType<typeof next>>
     try {
       result = await next(e)
     } finally {
       if (isNamed) void quietly(() => update($, activity, prev => ({ ...prev, working: prev.working.filter(work => work.id !== id) })))
+      if (isCrediting) closeCredit(await $.clock.now().catch(() => startedAt))
     }
     if (result.deny !== undefined) return result
     // Display only, so the tool's answer goes back without waiting for it.
     const finished = result
     void quietly(async () => {
       if (!finished.isError) await recordPlanned($, plan)
-      if (plan.mayWrite || plan.writes.length > 0) scheduleScan($, plan.mayWrite ? startedAt : null)
+      if (plan.mayWrite || plan.writes.length > 0) scheduleScan($, plan.mayWrite && startedAt > 0 ? startedAt : null)
     })
     return result
   })
@@ -783,7 +940,7 @@ export const register: Register = (on, options) => {
     const marks: Glyphs = Raster ? glyphs : GLYPHS.plain
     const current = await read($, layout)
     const lists = await read($, listings)
-    const git = await read($, gitView)
+    const git = viewFor(await read($, gitView), current.root)
     const list = await read($, touches)
     const act = await read($, activity)
     const at = Math.max(await read($, now), ...list.map(touch => touch.lastAt), 0)
@@ -797,7 +954,7 @@ export const register: Register = (on, options) => {
 
     const touchOf = new Map(list.map(touch => [touch.path, touch]))
     const inWork = workingKinds(act)
-    const marksOfFolders = folderMarks(current.root, list, git.changes)
+    const marksOfFolders = marksFor(current.root, list, git.changes)
     const ignored = new Set(git.ignored)
     const liveOf = (path: string): TouchKind | undefined => {
       const touch = touchOf.get(path)
@@ -805,16 +962,20 @@ export const register: Register = (on, options) => {
     }
 
     const query = current.query.trim()
-    const found = query ? findFiles(findIndex?.root === current.root ? findIndex.paths : [], query) : []
+    const found = query ? foundFor(indexFor(current.root) ?? NO_PATHS, query) : []
     // Files outside this folder have no place in its tree, so they stay in the card.
     const isTouchedTree = current.touchedOnly && !query
     const carded = isTouchedTree ? list.filter(touch => !isInside(current.root, touch.path)) : list
-    const touchedHere = list.length - carded.length
+    // What the tree holds with nothing folded: a touch of the folder itself, or of a path that turned out a folder, is no file row.
+    const touchedTree = isTouchedTree ? touchedTreeOf(current.root, touchOf.keys()) : null
+    const touchedHere = touchedTree ? touchedFilesIn(touchedTree) : 0
     const touchedShown = carded.slice(0, current.showAllTouched ? TOUCHED_SHOWN_ALL : TOUCHED_SHOWN)
     const rows = query
       ? []
       : isTouchedTree
-        ? buildTouchedRows(current.root, touchOf.keys(), new Set(current.touchedClosed), ignored)
+        ? touchedTree
+          ? touchedRowsOf(touchedTree, current.root, new Set(current.touchedClosed), ignored)
+          : []
         : buildRows(current, lists, ignored)
 
     // A very long tree is drawn around the window the person is looking at, with
@@ -825,7 +986,10 @@ export const register: Register = (on, options) => {
     const windowFrom = offset - headerRows - bodyRows
     const windowTo = offset - headerRows + bodyRows * 2
     const isDrawn = (row: TreeRow, index: number): boolean =>
-      rows.length <= WINDOW_FROM || (index >= windowFrom && index < windowTo) || liveOf(row.path) !== undefined
+      rows.length <= WINDOW_FROM ||
+      (index >= windowFrom && index < windowTo) ||
+      liveOf(row.path) !== undefined ||
+      (revealing !== '' && row.path === revealing)
 
     // Pictures need the click area too, as they cannot sit inside a Button.
     const pictures =
@@ -1226,7 +1390,7 @@ export const register: Register = (on, options) => {
           onPress={() =>
             update($, layout, prev =>
               isTouchedTree
-                ? { ...prev, touchedClosed: isAllFolded ? [] : touchedFolders.map(row => row.path) }
+                ? { ...prev, touchedClosed: isAllFolded ? [] : foldsOfAll(touchedFolders.map(row => row.path)) }
                 : { ...prev, expanded: [], autoOpened: {} },
             )
           }
@@ -1273,7 +1437,9 @@ export const register: Register = (on, options) => {
                   .catch(() => undefined)
               }}
               onSubmit={async value => {
-                const [first] = findFiles(findIndex?.paths ?? [], value)
+                // Only an index of the folder shown now: one of the folder before would find files outside it.
+                const { root } = await read($, layout)
+                const [first] = findFiles(indexFor(root) ?? [], value)
                 if (first) await showFile($, first)
               }}
             />
@@ -1285,7 +1451,7 @@ export const register: Register = (on, options) => {
     const touchedCard = carded.length > 0 && (
       <Box key="touched-frame" paddingX={inset} marginTop={1}>
         <Box key="touched" flexDirection="column" flexGrow={1} borderStyle="round" borderDimColor paddingX={1}>
-          {heading('touched-heading', isTouchedTree ? 'OUTSIDE THIS FOLDER' : 'CLAUDE TOUCHED', `${carded.length} FILE${carded.length === 1 ? '' : 'S'}`)}
+          {heading('touched-heading', isTouchedTree ? 'OUTSIDE THIS FOLDER' : 'CLAUDE TOUCHED', plural(carded.length).toUpperCase())}
           {touchedShown.map(touch => flatRow(`touched:${touch.path}`, touch.path, touch.kind, cardCols))}
           {carded.length > TOUCHED_SHOWN && (
             <Button
@@ -1325,13 +1491,13 @@ export const register: Register = (on, options) => {
           <Text dimColor>{'─'.repeat(cols)}</Text>
           <Box paddingX={inset} flexDirection="column">
             {isTouchedTree
-              ? heading('all-heading', 'CLAUDE TOUCHED', `${touchedHere} FILE${touchedHere === 1 ? '' : 'S'}`)
+              ? heading('all-heading', 'CLAUDE TOUCHED', plural(touchedHere).toUpperCase())
               : heading('all-heading', query ? `FOUND ${found.length}` : 'ALL FILES', clip(projectName, Math.floor(contentCols / 2)))}
           </Box>
         </Box>
         {query ? (
           <Box key="found" flexDirection="column" paddingX={inset}>
-            {found.length === 0 && <Text dimColor>{findIndex ? 'No file matches.' : 'Searching…'}</Text>}
+            {found.length === 0 && <Text dimColor>{indexFor(current.root) ? 'No file matches.' : 'Searching…'}</Text>}
             {found.map(path => flatRow(`found:${path}`, path, touchOf.get(path)?.kind, contentCols))}
           </Box>
         ) : rows.length === 0 ? (
@@ -1340,7 +1506,9 @@ export const register: Register = (on, options) => {
               {isTouchedTree
                 ? 'Claude has not touched a file in this folder yet.'
                 : !rootListing
-                  ? 'Reading the folder…'
+                  ? goneRoot === current.root
+                    ? 'This folder is gone.'
+                    : 'Reading the folder…'
                   : rootListing.entries.length > 0
                     ? 'Only hidden files here.'
                     : 'This folder is empty.'}
