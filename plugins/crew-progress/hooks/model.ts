@@ -6,6 +6,8 @@ import type { AgentInfo, ModelUsage } from 'claude-code'
 import type { AgentRun, AgentStatus, Plan, PlanStep, StepStatus } from '../types'
 
 export const MAX_AGENTS = 200
+/** Earlier runs kept per agent, for the Time total; the oldest go first. Few agents are ever woken this often. */
+export const MAX_SPANS = 200
 export const MAX_NOTE = 60
 export const MAX_RETIRED_TASKS = 500
 const MAX_STEPS = 100
@@ -17,22 +19,97 @@ const MAX_TEXT = 120
 const WIDE =
   /[ᄀ-ᅟ⺀-〾ぁ-㏿㐀-䶿一-鿿ꥠ-꥿가-힣豈-﫿︰-﹏！-｠￠-￦\u{1f300}-\u{1faff}\u{20000}-\u{3fffd}]/u
 
-/** Terminal cells the text takes: CJK and emoji take two. */
-export const cellWidth = (text: string): number => [...text].reduce((width, ch) => width + (WIDE.test(ch) ? 2 : 1), 0)
+/** Symbols of the Basic Multilingual Plane that emoji presentation draws two cells wide (✅ ⚡ ⌛), by code point. */
+const EMOJI_SYMBOLS: readonly (readonly [number, number])[] = [
+  [0x231a, 0x231b], [0x23e9, 0x23ec], [0x23f0, 0x23f0], [0x23f3, 0x23f3], [0x25fd, 0x25fe], [0x2614, 0x2615],
+  [0x2648, 0x2653], [0x267f, 0x267f], [0x2693, 0x2693], [0x26a1, 0x26a1], [0x26aa, 0x26ab], [0x26bd, 0x26be],
+  [0x26c4, 0x26c5], [0x26ce, 0x26ce], [0x26d4, 0x26d4], [0x26ea, 0x26ea], [0x26f2, 0x26f3], [0x26f5, 0x26f5],
+  [0x26fa, 0x26fa], [0x26fd, 0x26fd], [0x2705, 0x2705], [0x270a, 0x270b], [0x2728, 0x2728], [0x274c, 0x274c],
+  [0x274e, 0x274e], [0x2753, 0x2755], [0x2757, 0x2757], [0x2795, 0x2797], [0x27b0, 0x27b0], [0x27bf, 0x27bf],
+  [0x2b1b, 0x2b1c], [0x2b50, 0x2b50], [0x2b55, 0x2b55],
+]
 
-/** Cuts the text to at most `max` terminal cells. */
-export const clip = (text: string, max: number): string => {
-  if (cellWidth(text) <= max) return text
-  const room = Math.max(1, max - 1)
-  let kept = ''
-  let width = 0
-  for (const ch of text) {
-    const next = cellWidth(ch)
-    if (width + next > room) break
-    kept += ch
-    width += next
+/** Other two-cell characters the WIDE pattern leaves out. */
+const WIDE_SYMBOLS: readonly (readonly [number, number])[] = [
+  ...EMOJI_SYMBOLS,
+  // And the wide ones below U+1F300: mahjong, cards, squared words and ideographs.
+  [0x1f004, 0x1f004], [0x1f0cf, 0x1f0cf], [0x1f18e, 0x1f18e], [0x1f191, 0x1f19a], [0x1f200, 0x1f202],
+  [0x1f210, 0x1f23b], [0x1f240, 0x1f248], [0x1f250, 0x1f251], [0x1f260, 0x1f265],
+  // Angle brackets, Yi, vertical forms, and the Tangut and Kana supplements.
+  [0x2329, 0x232a], [0xa000, 0xa4cf], [0xfe10, 0xfe19], [0x16fe0, 0x16fe4], [0x17000, 0x187f7],
+  [0x18800, 0x18cd5], [0x1b000, 0x1b2fb],
+]
+
+const inRanges = (ranges: readonly (readonly [number, number])[], code: number): boolean =>
+  ranges.some(([low, high]) => code >= low && code <= high)
+
+const isWideSymbol = (code: number): boolean => inRanges(WIDE_SYMBOLS, code)
+
+/** An emoji a joiner may join to another: the pictographs of U+1F000 to U+1FAFF and the emoji symbols above. */
+const isEmoji = (code: number): boolean => (code >= 0x1f000 && code <= 0x1faff) || inRanges(EMOJI_SYMBOLS, code)
+
+/** Joins the glyphs either side of it into one, as in a family emoji. */
+const ZWJ = 0x200d
+
+/** The selector that asks for emoji presentation: it widens a one-cell character before it to two. */
+const EMOJI_PRESENTATION = 0xfe0f
+
+/** Marks that change the character before them and take no cell: text selectors, skin tones, combining marks, the keycap. */
+const isZeroWidth = (code: number): boolean =>
+  (code >= 0xfe00 && code <= 0xfe0e) ||
+  (code >= 0x1f3fb && code <= 0x1f3ff) ||
+  (code >= 0x0300 && code <= 0x036f) ||
+  (code >= 0x20d0 && code <= 0x20ff)
+
+/**
+ * Where a walk through the text stands: its cells so far, the last glyph's
+ * cells, whether that glyph is an emoji, and whether a joiner after it joins
+ * the next one to it.
+ */
+type WidthState = { width: number; last: number; isEmoji: boolean; isJoining: boolean }
+
+const START: WidthState = { width: 0, last: 0, isEmoji: false, isJoining: false }
+
+/** One character more: what `cellWidth` and `clip` both walk by. */
+const stepWidth = (state: WidthState, ch: string): WidthState => {
+  const code = ch.codePointAt(0) ?? 0
+  // A joiner joins an emoji to the emoji after it. After other text, or at the start, it joins nothing.
+  if (code === ZWJ) return { ...state, isJoining: state.isEmoji }
+  if (state.isJoining && isEmoji(code)) return { ...state, isEmoji: true, isJoining: false }
+  if (code === EMOJI_PRESENTATION) {
+    const widened = state.last === 1 ? { width: state.width + 1, last: 2 } : {}
+    return { ...state, ...widened, isEmoji: true, isJoining: false }
   }
-  return `${kept}…`
+  if (isZeroWidth(code)) return { ...state, isJoining: false }
+  const cells = WIDE.test(ch) || isWideSymbol(code) ? 2 : 1
+  return { width: state.width + cells, last: cells, isEmoji: isEmoji(code), isJoining: false }
+}
+
+/** Terminal cells the text takes: CJK and emoji take two, joiners, selectors and marks none. */
+export const cellWidth = (text: string): number => {
+  let state = START
+  for (const ch of text) state = stepWidth(state, ch)
+  return state.width
+}
+
+/** Cuts the text to at most `max` terminal cells, walking it once. */
+export const clip = (text: string, max: number): string => {
+  const room = Math.max(1, max - 1)
+  let state = START
+  let kept = ''
+  let isCut = false
+  for (const ch of text) {
+    state = stepWidth(state, ch)
+    if (state.width > max) {
+      // A joiner left at the end would join the ellipsis to the glyph before it.
+      const joiner = String.fromCodePoint(ZWJ)
+      return `${kept.endsWith(joiner) ? kept.slice(0, -joiner.length) : kept}…`
+    }
+    // Past the room the ellipsis leaves, the rest is kept only if the whole text fits.
+    if (state.width > room) isCut = true
+    if (!isCut) kept += ch
+  }
+  return text
 }
 
 // Tool inputs are the model's words: the schema is advice, these are the limits.
@@ -42,10 +119,11 @@ export const clean = (value: unknown, max = MAX_TEXT): string =>
 export const wholeNumber = (value: unknown): number | undefined =>
   typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.round(value)) : undefined
 
+// The unit is chosen by what the number rounds to, so 999,600 reads 1.0M, never 1000k.
 export const formatTokens = (n: number): string =>
-  n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : `${Math.round(n)}`
+  n >= 999_500 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : `${Math.round(n)}`
 
-export const formatCost = (usd: number): string => `$${usd < 10 ? usd.toFixed(2) : usd.toFixed(1)}`
+export const formatCost = (usd: number): string => `$${usd < 9.995 ? usd.toFixed(2) : usd.toFixed(1)}`
 
 export const formatTime = (ms: number): string => {
   const total = Math.max(0, Math.round(ms / 1000))
@@ -55,11 +133,17 @@ export const formatTime = (ms: number): string => {
   return hours ? `${hours}:${String(minutes).padStart(2, '0')}:${seconds}` : `${minutes}:${seconds}`
 }
 
+const titled = (word: string): string => `${word.charAt(0).toUpperCase()}${word.slice(1).toLowerCase()}`
+
 export const modelName = (id: string): string => {
+  // A version is one or two digits: an eight-digit date after the family is no version.
   const [, family = '', major = '', minor] =
-    /(fable|mythos|opus|sonnet|haiku)-(\d+)(?:-(\d{1,2})(?!\d))?/i.exec(id) ?? []
-  if (!family) return id.replace(/^claude-/, '').replace(/\[.*\]$/, '') || '—'
-  return `${family.charAt(0).toUpperCase()}${family.slice(1).toLowerCase()} ${major}${minor ? `.${minor}` : ''}`
+    /(fable|mythos|opus|sonnet|haiku)-(\d{1,2})(?!\d)(?:-(\d{1,2})(?!\d))?/i.exec(id) ?? []
+  if (family) return `${titled(family)} ${major}${minor ? `.${minor}` : ''}`
+  // The older order, version first: claude-3-5-sonnet-20241022.
+  const [, oldMajor = '', oldMinor, oldFamily = ''] = /claude-(\d)(?:-(\d))?-(opus|sonnet|haiku)/i.exec(id) ?? []
+  if (oldFamily) return `${titled(oldFamily)} ${oldMajor}${oldMinor ? `.${oldMinor}` : ''}`
+  return id.replace(/^claude-/, '').replace(/\[.*\]$/, '') || '—'
 }
 
 // ---------------------------------------------------------------------------
@@ -84,7 +168,8 @@ const PRICES: readonly (readonly [RegExp, Price])[] = [
 ]
 
 // Retired models are not on the pricing page, and the family rows would misprice them.
-const RETIRED = /claude-3|(?:opus|sonnet)-4(?:-1)?(?:-\d{8}|$)/
+// Opus and Sonnet 4.0 and 4.1, by any of their spellings: -4, -4-0, -4-1, a date, Vertex's @date, or [1m].
+const RETIRED = /claude-3|(?:opus|sonnet)-4(?:-[01])?(?:-\d{8}|@|\[|$)/
 
 // Haiku 5.5 alone is priced by prompt length, per request.
 const HAIKU_LONG_PROMPT = 100_000
@@ -92,6 +177,9 @@ const HAIKU_LONG: Price = [0.5, 2.5, 0.05, 1]
 
 export const promptTokens = (u: ModelUsage): number =>
   u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens
+
+/** Tokens processed, cache reads left out: they repeat on every request. */
+export const tokensOf = (u: ModelUsage): number => u.input_tokens + u.cache_creation_input_tokens + u.output_tokens
 
 const priceOf = (model: string, prompt: number): Price | undefined => {
   const id = model.toLowerCase()
@@ -118,9 +206,10 @@ export const costOf = (model: string, u: ModelUsage, prompt: number): number => 
   )
 }
 
-// Models before the 4.6 generation have a 200K window unless the id asks for 1M.
+// Models before the 4.6 generation have a 200K window unless the id asks for 1M. The
+// version is read right after the family name, so a later model's minor 4 is no 4.x.
 export const contextWindowOf = (model: string): number =>
-  !/\[1m\]/i.test(model) && /claude-3|-4-[0-5](?!\d)|-4-\d{8}|-4$/i.test(model) ? 200_000 : 1_000_000
+  !/\[1m\]/i.test(model) && /claude-3|(?:opus|sonnet|haiku)-4(?:-[0-5](?!\d)|-\d{8}|@|$)/i.test(model) ? 200_000 : 1_000_000
 
 // ---------------------------------------------------------------------------
 // The plan: Claude's own task list, or the `progress` tool where it has none.
@@ -152,11 +241,14 @@ const toStep = (id: string, text: unknown, status: StepStatus, activeText?: unkn
 export const reportedSteps = (value: unknown): string[] | undefined =>
   Array.isArray(value) ? value.map(s => clean(s)).filter(Boolean).slice(0, MAX_STEPS) : undefined
 
+/** Whether a report starts a new plan: a new title, or steps sent after the last plan was finished. */
+export const startsNewPlan = (prev: { title: string; isFinished: boolean } | null, title: string, texts: readonly string[] | undefined): boolean =>
+  (title !== '' && title !== prev?.title) || (texts !== undefined && (prev === null || prev.isFinished))
+
 export const applyReport = (prev: Plan | null, input: Report): Plan | null => {
   const title = clean(input.title)
   const texts = reportedSteps(input.steps)
-  const isNewTitle = title !== '' && title !== prev?.title
-  const startsOver = isNewTitle || (texts !== undefined && (prev === null || prev.isFinished))
+  const startsOver = startsNewPlan(prev, title, texts)
   // A report with nothing new must not wipe a finished plan or revive a cleared one.
   if (!startsOver && (prev === null || prev.isFinished)) return prev
 
@@ -223,6 +315,17 @@ type Todo = { content: string; status: string; activeForm?: string }
 export const stepsFromTodos = (todos: readonly Todo[]): PlanStep[] =>
   todos.slice(0, MAX_STEPS).map((todo, i) => toStep(String(i + 1), todo.content, statusOfTask(todo.status), todo.activeForm))
 
+/**
+ * A TodoWrite list on the session's plan. The same steps in the same order are
+ * the same work moving along, and keep a dismissed bar hidden; any other list is
+ * new work and brings it back. An empty list clears the plan.
+ */
+export const applyTodos = (prev: Plan | null, steps: readonly PlanStep[]): Plan | null => {
+  if (!steps.length) return null
+  const isSameWork = prev !== null && steps.length === prev.steps.length && steps.every((step, i) => prev.steps[i]?.text === step.text)
+  return { ...(prev ?? emptyPlan()), steps: [...steps], isDismissed: isSameWork && prev.isDismissed }
+}
+
 // ---------------------------------------------------------------------------
 // Subagents
 
@@ -247,7 +350,9 @@ export const newAgentRun = (id: string, type: string, description: string, model
   activity: '',
   stepDone: 0,
   stepTotal: 0,
+  stepTitle: '',
   note: '',
+  spans: [],
 })
 
 /** A row for an agent loop that no `agent.spawn` announced, such as a forked skill. */
@@ -256,14 +361,20 @@ export const listedAgentRun = (info: Pick<AgentInfo, 'id' | 'type' | 'descriptio
   fromList: true,
 })
 
-/** A row named by what announced it (a spawn, a Skill call): its words, and its model if it had none. */
-export const namedRun = (a: AgentRun, type: string, description: unknown, model: string): AgentRun => ({
-  ...a,
-  fromList: false,
-  type: type || a.type,
-  description: clean(description) || a.description,
-  ...(a.model ? {} : { model, contextMax: contextWindowOf(model) }),
-})
+/** A row named by what announced it (a spawn, a Skill call): its words, and its model if it had none. The same row when nothing changes. */
+export const namedRun = (a: AgentRun, type: string, description: unknown, model: string): AgentRun => {
+  const nextType = type || a.type
+  const nextDescription = clean(description) || a.description
+  const nextModel = a.model || model
+  if (!a.fromList && nextType === a.type && nextDescription === a.description && nextModel === a.model) return a
+  return {
+    ...a,
+    fromList: false,
+    type: nextType,
+    description: nextDescription,
+    ...(a.model ? {} : { model, contextMax: contextWindowOf(model) }),
+  }
+}
 
 /** A forked skill's row is named for the command as it was called; '' with no name. */
 export const skillLabel = (name: unknown, args: unknown): string => {
@@ -271,11 +382,29 @@ export const skillLabel = (name: unknown, args: unknown): string => {
   return command ? clean(`/${command} ${typeof args === 'string' ? args : ''}`) : ''
 }
 
-/** A run that ended and is working again. Its earlier time is kept and the gap is not. */
-export const resumeRun = (a: AgentRun, at: number): AgentRun =>
-  isRunning(a)
-    ? a
-    : { ...a, status: 'running', endedAt: undefined, priorMs: a.priorMs + (a.endedAt ?? at) - a.startedAt, startedAt: at }
+/**
+ * A run that ended and is working again. Its earlier time is kept, as a span for the Time total, and the gap is not.
+ * A span dropped past the bound leaves its length in `droppedMs`, so the total never goes down; dropped spans count
+ * in full, so past MAX_SPANS runs one agent's time that overlapped another's can count twice.
+ */
+export const resumeRun = (a: AgentRun, at: number): AgentRun => {
+  if (isRunning(a)) return a
+  const spans: [number, number][] = [...a.spans, [a.startedAt, a.endedAt ?? at]]
+  const dropped = spans.slice(0, Math.max(0, spans.length - MAX_SPANS))
+  return {
+    ...a,
+    status: 'running',
+    endedAt: undefined,
+    priorMs: a.priorMs + (a.endedAt ?? at) - a.startedAt,
+    spans: spans.slice(-MAX_SPANS),
+    droppedMs: (a.droppedMs ?? 0) + dropped.reduce((sum, [from, to]) => sum + Math.max(0, to - from), 0),
+    runRequests: 0,
+    startedAt: at,
+  }
+}
+
+/** A run that ended, with how: what a turn's end, a Skill call and the safety net all write. */
+export const endedRun = (a: AgentRun, status: AgentStatus, at: number): AgentRun => ({ ...a, status, endedAt: at, activity: '' })
 
 export const statusOfTurnEnd = (reason: string): AgentStatus =>
   reason === 'answer' ? 'done' : reason === 'aborted' ? 'stopped' : 'failed'
@@ -302,17 +431,32 @@ export const activityOf = (e: { tool: string }): string => {
 }
 
 // Time when at least one subagent was at work: overlaps count once, gaps not at all.
+// Each row brings its earlier runs' spans and its current run's; spans dropped past
+// the bound count by their length alone.
 const busyTime = (list: readonly AgentRun[], at: number): number => {
   const spans = list
-    .map(a => [a.startedAt, a.endedAt ?? Math.max(at, a.startedAt)] as const)
+    .flatMap(a => [...a.spans, [a.startedAt, a.endedAt ?? Math.max(at, a.startedAt)] as [number, number]])
     .sort((x, y) => x[0] - y[0])
-  let total = list.reduce((sum, a) => sum + a.priorMs, 0)
+  let total = list.reduce((sum, a) => sum + (a.droppedMs ?? 0), 0)
   let covered = -Infinity
   for (const [from, to] of spans) {
     total += Math.max(0, to - Math.max(from, covered))
     covered = Math.max(covered, to)
   }
   return total
+}
+
+/**
+ * Keeps the list to MAX_AGENTS rows: ended rows go first, the longest ended
+ * first, and a running row only when every row is running.
+ */
+export const capAgents = (rows: readonly AgentRun[], max = MAX_AGENTS): AgentRun[] => {
+  if (rows.length <= max) return [...rows]
+  const excess = rows.length - max
+  const ended = rows.filter(a => !isRunning(a)).sort((x, y) => (x.endedAt ?? x.startedAt) - (y.endedAt ?? y.startedAt))
+  const dropped = new Set(ended.slice(0, excess))
+  const kept = rows.filter(a => !dropped.has(a))
+  return kept.slice(kept.length - max)
 }
 
 export const totals = (list: readonly AgentRun[], at: number) => ({
@@ -350,7 +494,10 @@ export type Overview = {
   total: number
   /** How many of the rest are being worked on now. */
   inFlight: number
+  /** Subagents that failed. One the person stopped is not a failure. */
   failed: number
+  /** Subagents the person stopped. */
+  stopped: number
   isComplete: boolean
 }
 
@@ -364,8 +511,10 @@ export const overviewOf = (p: Plan | null, shown: readonly AgentRun[]): Overview
       detail: p.title ? current : '',
       done: doneCount(p.steps),
       total: p.steps.length,
-      inFlight: active ? 1 : 0,
+      // Several tasks can be in progress at once, each by its own subagent.
+      inFlight: p.steps.filter(s => s.status === 'active').length,
       failed: 0,
+      stopped: 0,
       isComplete: isPlanComplete(p),
     }
   }
@@ -378,7 +527,8 @@ export const overviewOf = (p: Plan | null, shown: readonly AgentRun[]): Overview
     done: shown.length - running,
     total: shown.length,
     inFlight: running,
-    failed: shown.filter(hasFailed).length,
+    failed: shown.filter(a => a.status === 'failed').length,
+    stopped: shown.filter(a => a.status === 'stopped').length,
     isComplete: running === 0,
   }
 }

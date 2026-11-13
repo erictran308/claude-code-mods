@@ -42,7 +42,17 @@ export type AgentRun = {
   activity: string
   stepDone: number
   stepTotal: number
+  /** The title of the plan the agent last reported with the progress tool. */
+  stepTitle: string
   note: string
+  /** Whether the agent's last progress report said its plan was finished: only then do new steps start the count over. */
+  stepFinished?: boolean
+  /** Earlier runs of this agent, `[start, end]`, newest last and a bounded few: the Time total counts each overlap once. */
+  spans: [number, number][]
+  /** The length of earlier runs dropped from `spans` past the bound, still counted in the Time total. */
+  droppedMs?: number
+  /** Requests seen in this run alone. Absent on a row that has had one run only: `requests` stands for it then. */
+  runRequests?: number
   /** Made from the engine's list before any spawn named it, so the spawn's words win. */
   fromList?: boolean
 }

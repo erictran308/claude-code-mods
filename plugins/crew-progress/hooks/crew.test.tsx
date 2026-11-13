@@ -2,8 +2,8 @@ import type { On } from 'claude-code'
 import { expect, mock, test } from 'claude-code/testing'
 import type { Engine } from 'claude-code/testing'
 
-import type { AgentRun } from '../types'
-import { clip, cellWidth, contextWindowOf, costOf, elapsed, newAgentRun, overviewOf, resumeRun, skillLabel, syncTaskList, totals } from './model'
+import type { AgentRun, PlanStep } from '../types'
+import { applyTodos, capAgents, clip, cellWidth, contextWindowOf, costOf, elapsed, emptyPlan, formatCost, formatTokens, MAX_SPANS, modelName, namedRun, newAgentRun, overviewOf, resumeRun, skillLabel, syncTaskList, totals } from './model'
 
 const PLUGIN = 'crew-progress'
 const PROGRESS = 'mcp__crew-progress__progress'
@@ -443,7 +443,7 @@ test('/crew says why when the panel cannot be shown', async ($, on) => {
   expect((await runCrew($, 'open'))?.text).toBe('Crew panel is waiting: no-surface')
 })
 
-test('subagents that all failed are not shown as a success', async ($, on) => {
+test('a failed subagent is not shown as a success, and a stopped one is not counted as failed', async ($, on) => {
   engine(on, 'claude-haiku-5-5')
   await spawn($, 'a1', 'One')
   await spawn($, 'a2', 'Two')
@@ -454,13 +454,35 @@ test('subagents that all failed are not shown as a success', async ($, on) => {
   const row = await text.find({ type: 'Text', text: /2\/2/ })
   expect(row?.text).toContain('✗')
   expect(row?.text).not.toContain('✓')
-  expect(row?.text).toContain('2 failed')
+  expect(row?.text).toContain('1 failed')
+  expect(row?.text).toContain('1 stopped')
   await text.unmount()
 
   const terminal = await $.ui.mount({ ...BAND, surface: 'terminal' })
   const pill = glyphsOf(await terminal.find({ key: 'bar' }))
-  expect(pill).toContain('2 failed')
+  expect(pill).toContain('1 failed')
   expect(pill).not.toContain('Done')
+  await terminal.unmount()
+})
+
+test('a crew whose only end was a stop reads as stopped, not as failed in red', async ($, on) => {
+  engine(on, 'claude-haiku-5-5')
+  await spawn($, 'a1', 'Done')
+  await spawn($, 'a2', 'Interrupted')
+  await finish($, 'a1')
+  await finish($, 'a2', 'aborted')
+
+  const text = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  const row = await text.find({ type: 'Text', text: /2\/2/ })
+  expect(row?.text).toContain('✓')
+  expect(row?.text).not.toContain('failed')
+  expect(row?.text).toContain('1 stopped')
+  await text.unmount()
+
+  const terminal = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  const pill = glyphsOf(await terminal.find({ key: 'bar' }))
+  expect(pill).toContain('1 stopped')
+  expect(pill).not.toContain('failed')
   await terminal.unmount()
 })
 
@@ -558,6 +580,40 @@ test('the task list is still followed behind a dismissed bar', async ($, on) => 
   await ui.unmount()
 })
 
+const todos = ($: Engine, items: readonly [string, string][]) =>
+  $.tool.call({ tool: 'TodoWrite', todos: items.map(([content, status]) => ({ content, status, activeForm: content })) } as never)
+
+test('the same todo list moving along stays dismissed, and a new one brings the bar back', async ($, on) => {
+  mock.clock(on, { now: T0 })
+  emptySlot(on)
+  on('tool.call', { tool: 'TodoWrite' }, () => ({ result: {} }) as never)
+  await todos($, [['Run tests', 'pending'], ['Fix lint', 'pending'], ['Commit', 'pending']])
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /0\/3/ })).toBeDefined()
+  await ui.press({ key: 'dismiss' })
+
+  await todos($, [['Run tests', 'completed'], ['Fix lint', 'in_progress'], ['Commit', 'pending']])
+  expect(await ui.find({ type: 'Text', text: /1\/3/ })).toBeUndefined()
+
+  // Fewer steps, all of them seen before: still new work.
+  await todos($, [['Run tests', 'pending'], ['Commit', 'pending']])
+  expect(await ui.find({ type: 'Text', text: /0\/2/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('the dismiss button hides a running subagent too', async ($, on) => {
+  const clock = engine(on, 'claude-haiku-5-5')
+  emptySlot(on)
+  await spawn($, 'a1', 'Long worker')
+  await clock.advance(1000)
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /0\/1/ })).toBeDefined()
+  await ui.press({ key: 'dismiss' })
+  expect(await ui.find({ type: 'Text', text: /0\/1/ })).toBeUndefined()
+  await ui.unmount()
+})
+
 test('a refused TaskUpdate does not move the bar', async ($, on) => {
   emptySlot(on)
   on('tool.call', { tool: 'TaskCreate' }, (_, e) => ({ result: { task: { id: '1', subject: e.subject } } }) as never)
@@ -639,6 +695,76 @@ test('a run whose end went unheard is closed from the engine\'s own list', async
   await ui.unmount()
 })
 
+test('a row the engine listed, then dropped, ends when it was first missed', async ($, on) => {
+  const clock = engine(on, 'claude-haiku-5-5')
+  let onList = true
+  on('agent.list', () => ({ value: onList ? [{ id: 'a1', description: 'x', type: 'Explore', status: 'running' }] : [] }) as never)
+  await startSession($, on, false, ['TaskCreate'])
+  await spawn($, 'a1', 'Lost end')
+  // Seen on the list at the first check, then gone.
+  await clock.advance(4000)
+  onList = false
+  await clock.advance(4000)
+  for (let i = 0; i < 30; i++) await clock.advance(4000)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /Running/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', label: '▾ Finished · 1' } as never)).toBeDefined()
+  // It ended when first missed, eight seconds in, not two minutes later.
+  expect(await ui.find({ type: 'Text', text: /0:08/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a row the engine never listed, such as a remote agent, is left running', async ($, on) => {
+  const clock = engine(on, 'claude-haiku-5-5')
+  on('agent.list', () => ({ value: [] }) as never)
+  await startSession($, on, false, ['TaskCreate'])
+  await spawn($, 'r1', 'Remote')
+  for (let i = 0; i < 40; i++) await clock.advance(4000)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /Running · 1/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a run woken after an earlier miss gets its own two minutes', async ($, on) => {
+  const clock = engine(on, 'claude-haiku-5-5')
+  on('turn.start', (_, e) => ({ turnId: e.turnId }) as never)
+  let onList = true
+  on('agent.list', () => ({ value: onList ? [{ id: 't1', description: 'x', type: 'Explore', status: 'running' }] : [] }) as never)
+  await startSession($, on, false, ['TaskCreate'])
+  await spawn($, 't1', 'Teammate')
+  // Seen, then missed, then its end is heard: no row runs, so the list goes unchecked.
+  await clock.advance(4000)
+  onList = false
+  await clock.advance(4000)
+  await finish($, 't1')
+  for (let i = 0; i < 40; i++) await clock.advance(4000)
+  // Woken long after, still off the list: the old miss does not end it.
+  await startTurn($, 't1')
+  for (let i = 0; i < 5; i++) await clock.advance(4000)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /Running · 1/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('an agent listed only when it was spawned still ends once it drops off the list', async ($, on) => {
+  const clock = engine(on, 'claude-haiku-5-5')
+  let onList = true
+  on('agent.list', () => ({ value: onList ? [{ id: 'q1', description: 'x', type: 'Explore', status: 'running' }] : [] }) as never)
+  await startSession($, on, false, ['TaskCreate'])
+  await spawn($, 'q1', 'Quick')
+  // Gone before any check of the list.
+  onList = false
+  for (let i = 0; i < 40; i++) await clock.advance(4000)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /Running/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', label: '▾ Finished · 1' } as never)).toBeDefined()
+  await ui.unmount()
+})
+
 const startTurn = ($: Engine, agentId: string) =>
   ($.turn.start as (e: unknown) => Promise<unknown>)({ text: '', turnId: 't', agentId })
 
@@ -707,6 +833,21 @@ test('a forked skill that did not launch adds no row', async ($, on) => {
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect(await ui.find({ type: 'Text', text: /No subagents yet/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a background forked skill whose launch failed ends the row its first turn made', async ($, on) => {
+  engine(on, 'claude-opus-5-5')
+  on('turn.start', (_, e) => ({ turnId: e.turnId }) as never)
+  listed(on, [{ id: 'f1', description: 'code-review', type: 'general-purpose' }])
+  forkedSkill(on, false)
+
+  await startTurn($, 'f1')
+  await $.tool.call({ tool: 'Skill', skill: 'code-review' } as never)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /Running/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', label: '▾ Finished · 1' } as never)).toBeDefined()
   await ui.unmount()
 })
 
@@ -844,6 +985,20 @@ test('a resumed subagent keeps the words its row had', async ($, on) => {
   await ui.unmount()
 })
 
+test("a listed row answered by a resume keeps its words and takes the spawn's model", async ($, on) => {
+  engine(on, 'claude-sonnet-4-5')
+  on('turn.start', (_, e) => ({ turnId: e.turnId }) as never)
+  listed(on, [{ id: 'a1', description: 'Map the auth flow', type: '' }])
+
+  await startTurn($, 'a1')
+  await spawn($, 'a1', 'Continue', true)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Button', label: 'Map the auth flow' } as never)).toBeDefined()
+  expect((await ui.find({ type: 'Text', text: /Explore/ }))?.text).toBe('  Explore · Sonnet 4.5')
+  await ui.unmount()
+})
+
 test("the engine's own forks, on no list, get no row", async ($, on) => {
   const model = 'claude-haiku-5-5'
   engine(on, model)
@@ -884,6 +1039,20 @@ test('a tool call that was refused does not count as a tool used', async ($, on)
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect((await ui.find({ type: 'Text', text: /Explore/ }))?.text).toBe('  Explore · Haiku 5.5')
+  await ui.unmount()
+})
+
+test('a refused tool call puts back what the worker was doing', async ($, on) => {
+  engine(on, 'claude-haiku-5-5')
+  on('tool.call', { tool: 'Read' }, () => ({ result: {} }) as never)
+  on('tool.call', { tool: 'Bash' }, () => ({ deny: 'refused' }))
+  await spawn($, 'a1', 'Worker')
+
+  await $.tool.call({ tool: 'Read', file_path: '/repo/src/auth/login.ts', agentId: 'a1' } as never)
+  await $.tool.call({ tool: 'Bash', command: 'rm -rf build', agentId: 'a1' } as never)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ type: 'Text', text: /↳/ }))?.text).toBe('  ↳ Read auth/login.ts')
   await ui.unmount()
 })
 
@@ -939,6 +1108,11 @@ test('context windows follow the model id', () => {
   expect(contextWindowOf('claude-sonnet-4-5[1m]')).toBe(1_000_000)
   expect(contextWindowOf('claude-opus-4-6')).toBe(1_000_000)
   expect(contextWindowOf('claude-opus-5-5')).toBe(1_000_000)
+  // Vertex spells the date after an @.
+  expect(contextWindowOf('claude-sonnet-4@20250514')).toBe(200_000)
+  expect(contextWindowOf('claude-opus-4-1@20250805')).toBe(200_000)
+  // A later model's minor version 4 is no 4.x model.
+  expect(contextWindowOf('claude-sonnet-5-4-20270101')).toBe(1_000_000)
 })
 
 test('retired models count as unknown rather than mispriced', () => {
@@ -947,6 +1121,15 @@ test('retired models count as unknown rather than mispriced', () => {
   expect(costOf('claude-opus-4-1', usage, 0)).toBe(0)
   expect(costOf('us.anthropic.claude-opus-4-1-20250805-v1:0', usage, 0)).toBe(0)
   expect(costOf('claude-opus-4-8', usage, 0)).toBe(30)
+  // Every spelling of 4.0 and 4.1: a trailing -0, a date, a context suffix.
+  expect(costOf('claude-opus-4-0', usage, 0)).toBe(0)
+  expect(costOf('claude-sonnet-4-0', usage, 0)).toBe(0)
+  expect(costOf('claude-sonnet-4[1m]', usage, 0)).toBe(0)
+  expect(costOf('claude-sonnet-4-5', usage, 0)).toBe(18)
+  // Vertex's @date spellings are retired too.
+  expect(costOf('claude-opus-4-1@20250805', usage, 0)).toBe(0)
+  expect(costOf('claude-sonnet-4@20250514', usage, 0)).toBe(0)
+  expect(costOf('claude-opus-4-5@20251101', usage, 0)).toBe(30)
 })
 
 test('over-long task lists keep the newest tasks', () => {
@@ -963,6 +1146,62 @@ test('text is cut by terminal cells, so wide titles fit', () => {
 
   expect(cellWidth(cut)).toBeLessThanOrEqual(7)
   expect(cut.endsWith('…')).toBe(true)
+})
+
+test('numbers round into the next unit rather than past it', () => {
+  expect(formatTokens(999_600)).toBe('1.0M')
+  expect(formatTokens(999_400)).toBe('999k')
+  expect(formatCost(9.996)).toBe('$10.0')
+  expect(formatCost(9.99)).toBe('$9.99')
+})
+
+test('model names read the version, never a date, in either order', () => {
+  expect(modelName('claude-opus-5-5')).toBe('Opus 5.5')
+  expect(modelName('claude-sonnet-4-20250514')).toBe('Sonnet 4')
+  expect(modelName('claude-3-5-sonnet-20241022')).toBe('Sonnet 3.5')
+  expect(modelName('claude-3-haiku-20240307')).toBe('Haiku 3')
+})
+
+test('emoji symbols take two cells, and text selectors and marks none', () => {
+  expect(cellWidth('✅ done')).toBe(7)
+  expect(cellWidth(`a${String.fromCodePoint(0xfe0e)}`)).toBe(1)
+  expect(cellWidth(String.fromCodePoint(0x1f004))).toBe(2)
+  // A combining accent, and the Yi and angle-bracket ranges.
+  expect(cellWidth(`e${String.fromCodePoint(0x0301)}`)).toBe(1)
+  expect(cellWidth(String.fromCodePoint(0xa000))).toBe(2)
+  expect(cellWidth(String.fromCodePoint(0x2329))).toBe(2)
+})
+
+test('a joined emoji sequence is one glyph of two cells', () => {
+  const zwj = String.fromCodePoint(0x200d)
+  const family = [0x1f468, 0x1f469, 0x1f467].map(code => String.fromCodePoint(code)).join(zwj)
+  expect(cellWidth(family)).toBe(2)
+  // A keycap: a digit, the emoji selector and the enclosing keycap mark.
+  expect(cellWidth(`1${String.fromCodePoint(0xfe0f)}${String.fromCodePoint(0x20e3)}`)).toBe(2)
+  // Cut text never ends on a joiner.
+  const cut = clip(`ab${zwj}cdefgh`, 4)
+  expect(cut.includes(`${zwj}…`)).toBe(false)
+  expect(cellWidth(cut)).toBeLessThanOrEqual(4)
+})
+
+test('the emoji selector widens the one-cell character before it', () => {
+  const heart = `${String.fromCodePoint(0x2764)}${String.fromCodePoint(0xfe0f)}`
+  expect(cellWidth(`${heart} x`)).toBe(4)
+  // A wide character stays two cells with it.
+  expect(cellWidth(`${String.fromCodePoint(0x2705)}${String.fromCodePoint(0xfe0f)}`)).toBe(2)
+  // Cut text counts the selector with what it follows.
+  const cut = clip(`${heart}${heart}${heart} ship it`, 5)
+  expect(cellWidth(cut)).toBeLessThanOrEqual(5)
+})
+
+test('a TodoWrite list keeps a dismissed bar hidden only while it is the same list', () => {
+  const step = (text: string, status: PlanStep['status'] = 'pending'): PlanStep => ({ id: text, text, status })
+  const dismissed = { ...emptyPlan(), steps: [step('Run tests'), step('Commit')], isDismissed: true }
+  expect(applyTodos(dismissed, [step('Run tests', 'done'), step('Commit', 'active')])?.isDismissed).toBe(true)
+  expect(applyTodos(dismissed, [step('Commit'), step('Run tests')])?.isDismissed).toBe(false)
+  expect(applyTodos(dismissed, [step('Run tests')])?.isDismissed).toBe(false)
+  expect(applyTodos(null, [step('Run tests')])?.isDismissed).toBe(false)
+  expect(applyTodos(dismissed, [])).toBeNull()
 })
 
 test('terminal: the panel is inset, separators run full width, and the status icon has room to grow', async ($, on) => {
@@ -1001,4 +1240,241 @@ test('terminal: a blank row separates each heading from the first subagent', asy
   expect((await ui.find({ key: 'running-heading' }))?.props.marginBottom).toBe(1)
   expect((await ui.find({ key: 'finished-heading' }))?.props.marginBottom).toBe(1)
   await ui.unmount()
+})
+
+// --- Round 6
+
+test("Claude Code's word that a subagent stopped ends its row, unless a hook keeps it going", async ($, on) => {
+  engine(on, 'claude-haiku-5-5')
+  on('classic.SubagentStop', (_, e) => ((e as { agent_id?: string }).agent_id === 'a2' ? { block: 'keep going' } : {}) as never)
+  await spawn($, 'a1', 'First')
+  await spawn($, 'a2', 'Kept going')
+  const stop = $.classic.SubagentStop as (e: unknown) => Promise<unknown>
+  await stop({ agent_id: 'a1', agent_type: 'Explore', agent_transcript_path: '', stop_hook_active: false })
+  await stop({ agent_id: 'a2', agent_type: 'Explore', agent_transcript_path: '', stop_hook_active: false })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /Running · 1/ })).toBeDefined()
+  expect(await ui.find({ type: 'Button', label: '▾ Finished · 1' } as never)).toBeDefined()
+  await ui.unmount()
+})
+
+test("the Time total counts an agent's earlier runs once beside the others", () => {
+  const resumed = resumeRun(run({ status: 'done', startedAt: 0, endedAt: 10_000 }), 20_000)
+  const a = { ...resumed, status: 'done' as const, endedAt: 30_000 }
+  const b = run({ id: 'b', status: 'done', startedAt: 0, endedAt: 10_000 })
+  // A and B share 0 to 10s; A runs again from 20s to 30s.
+  expect(totals([a, b], 40_000).time).toBe(20_000)
+
+  let many = run({ status: 'done', startedAt: 0, endedAt: 1 })
+  for (let i = 1; i <= MAX_SPANS + 5; i++) many = { ...resumeRun(many, i * 10), status: 'done', endedAt: i * 10 + 1 }
+  expect(many.spans).toHaveLength(MAX_SPANS)
+})
+
+test("a worker's new plan starts its count over", async ($, on) => {
+  engine(on, 'claude-haiku-5-5')
+  await spawn($, 'a1', 'Worker')
+  const countOnRow = async (): Promise<string | undefined> => {
+    const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+    const text = (await ui.find({ type: 'Text', text: /ctx/ }))?.text
+    await ui.unmount()
+    return text
+  }
+
+  await $.tool.call({ tool: PROGRESS, steps: ['a', 'b', 'c'], finished: true, agentId: 'a1' } as never)
+  expect(await countOnRow()).toContain('3/3 ·')
+  // New steps after a finished plan, no count given: nothing of them is done yet.
+  await $.tool.call({ tool: PROGRESS, steps: ['w', 'x', 'y', 'z'], agentId: 'a1' } as never)
+  expect(await countOnRow()).toContain('0/4 ·')
+  await $.tool.call({ tool: PROGRESS, done: 2, agentId: 'a1' } as never)
+  expect(await countOnRow()).toContain('2/4 ·')
+  // A new title starts over too; the same title again does not.
+  await $.tool.call({ tool: PROGRESS, title: 'Phase 2', steps: ['p', 'q', 'r'], agentId: 'a1' } as never)
+  expect(await countOnRow()).toContain('0/3 ·')
+  await $.tool.call({ tool: PROGRESS, done: 1, agentId: 'a1' } as never)
+  await $.tool.call({ tool: PROGRESS, title: 'Phase 2', agentId: 'a1' } as never)
+  expect(await countOnRow()).toContain('1/3 ·')
+})
+
+test("a worker's plan that only reached its last step goes on when it grows", async ($, on) => {
+  engine(on, 'claude-haiku-5-5')
+  await spawn($, 'a1', 'Worker')
+  await $.tool.call({ tool: PROGRESS, steps: ['a', 'b', 'c'], agentId: 'a1' } as never)
+  await $.tool.call({ tool: PROGRESS, done: 3, agentId: 'a1' } as never)
+  // Two steps found on the way: the three done stay done.
+  await $.tool.call({ tool: PROGRESS, steps: ['a', 'b', 'c', 'd', 'e'], agentId: 'a1' } as never)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ type: 'Text', text: /ctx/ }))?.text).toContain('3/5 ·')
+  await ui.unmount()
+})
+
+const finishWith = ($: Engine, agentId: string, model: string) =>
+  ($.turn.complete as (e: unknown) => Promise<unknown>)({ agentId, reason: 'answer', answer: 'ok', usage: { model, ...USAGE } })
+
+const tokensShown = async ($: Engine): Promise<string | undefined> => {
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const text = (await ui.find({ type: 'Text', text: / tokens · / }))?.text
+  await ui.unmount()
+  return text
+}
+
+test("each run whose requests went unseen adds its turn's sum to the row's totals", async ($, on) => {
+  const model = 'claude-haiku-5-5'
+  engine(on, model)
+  on('turn.start', (_, e) => ({ turnId: e.turnId }) as never)
+  await spawn($, 't1', 'Teammate')
+  await finishWith($, 't1', model)
+  expect(await tokensShown($)).toContain('12k tokens')
+  // Woken twice more, its requests unseen each time: the sums add up.
+  await startTurn($, 't1')
+  await finishWith($, 't1', model)
+  await startTurn($, 't1')
+  await finishWith($, 't1', model)
+  expect(await tokensShown($)).toContain('36k tokens')
+})
+
+test("a run whose requests went unseen adds its sum even after a run whose requests were seen", async ($, on) => {
+  const model = 'claude-haiku-5-5'
+  engine(on, model)
+  on('turn.start', (_, e) => ({ turnId: e.turnId }) as never)
+  await spawn($, 't1', 'Teammate')
+  await step($, 't1', model)
+  await finishWith($, 't1', model)
+  expect(await tokensShown($)).toContain('12k tokens')
+  await startTurn($, 't1')
+  await finishWith($, 't1', model)
+  expect(await tokensShown($)).toContain('24k tokens')
+})
+
+test("a workflow agent that comes back with no id of its own gets no row", async ($, on) => {
+  mock.clock(on, { now: T0 })
+  on('agent.spawn', () => ({ model: 'claude-haiku-5-5' }) as never)
+  await $.agent.spawn({
+    tool_use_id: 'wf-call',
+    prompt: 'p',
+    description: 'Remote step',
+    subagentType: 'general-purpose',
+    provider: 'engine',
+    parentModel: 'claude-opus-5-5',
+    background: true,
+    fork: false,
+    workflow: { runId: 'wf_1', agentIndex: 1 },
+  } as never)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /No subagents yet/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('terminal: the robot takes its own cell in the band, the gap after it holding the wider icon', async ($, on) => {
+  engine(on, 'claude-haiku-5-5')
+  await spawn($, 'a1', 'Worker')
+
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal', props: { ...BAND.props, bodyColumns: 64 } })
+  const { columns } = (await ui.find({ key: 'bar' }) as unknown as { props: { columns: number } }).props
+  // Spinner, space and 'Subagents' (11), '0%' (2), the robot (1), '×1' (2), ✕ (1), and a cell between each of the six parts.
+  expect(columns).toBe(64 - 11 - 2 - 1 - 2 - 1 - 5)
+  await ui.unmount()
+})
+
+test("the Time total never goes down when an agent's oldest runs are dropped", () => {
+  let many = run({ status: 'done', startedAt: 0, endedAt: 1000 })
+  let total = totals([many], 0).time
+  for (let i = 1; i <= MAX_SPANS + 5; i++) {
+    many = { ...resumeRun(many, i * 10_000), status: 'done', endedAt: i * 10_000 + 1000 }
+    const next = totals([many], i * 10_000 + 1000).time
+    expect(next).toBeGreaterThanOrEqual(total)
+    total = next
+  }
+  expect(many.spans).toHaveLength(MAX_SPANS)
+  // Every run lasted one second.
+  expect(total).toBe((MAX_SPANS + 6) * 1000)
+})
+
+test('a subagent that starts after a quiet spell still has its lost end caught from the list', async ($, on) => {
+  const clock = engine(on, 'claude-haiku-5-5')
+  let onList = true
+  on('agent.list', () => ({ value: onList ? [{ id: 'b1', description: 'x', type: 'Explore', status: 'running' }] : [] }) as never)
+  await startSession($, on, false, ['TaskCreate'])
+  await spawn($, 'a1', 'First')
+  await finish($, 'a1')
+  // Nothing moves for a while (the clock may stop: the kit cannot see an idle timer, so only the restart is checked).
+  for (let i = 0; i < 10; i++) await clock.advance(4000)
+  // A new subagent starts it again, so its lost end is still caught from the list.
+  await spawn($, 'b1', 'Second')
+  await clock.advance(4000)
+  onList = false
+  for (let i = 0; i < 40; i++) await clock.advance(4000)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /Running/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', label: '▾ Finished · 2' } as never)).toBeDefined()
+  await ui.unmount()
+})
+
+test('over the limit, ended rows give way before running ones', () => {
+  const rows = [
+    run({ id: 'live', startedAt: 0 }),
+    ...Array.from({ length: 200 }, (_, i) => run({ id: `e${i}`, status: 'done', startedAt: i, endedAt: i + 1 })),
+  ]
+  const kept = capAgents(rows, 200)
+  expect(kept).toHaveLength(200)
+  expect(kept.some(a => a.id === 'live')).toBe(true)
+  expect(kept.some(a => a.id === 'e0')).toBe(false)
+  // Only when every row runs does the oldest go.
+  const running = Array.from({ length: 3 }, (_, i) => run({ id: `r${i}`, startedAt: i }))
+  expect(capAgents(running, 2).map(a => a.id)).toEqual(['r1', 'r2'])
+})
+
+test('a joiner joins emoji to emoji, and nothing else', () => {
+  const zwj = String.fromCodePoint(0x200d)
+  const man = String.fromCodePoint(0x1f468)
+  const woman = String.fromCodePoint(0x1f469)
+  expect(cellWidth(`a${zwj}b`)).toBe(2)
+  expect(cellWidth(`${zwj}${String.fromCodePoint(0x1f600)}`)).toBe(2)
+  expect(cellWidth(`${man}${zwj}${woman}`)).toBe(2)
+  expect(cellWidth(`${man}${zwj}a`)).toBe(3)
+})
+
+test('/crew says so when another plugin holds the pane, and throws nothing', async ($, on) => {
+  engine(on, 'claude-haiku-5-5', USAGE, () => ({ deny: 'another plugin holds crew' }))
+  on('ui.panes', () => ({ value: [] }) as never)
+
+  expect((await runCrew($, 'open')).text).toMatch(/^Crew panel could not open: /)
+  expect((await runCrew($)).text).toMatch(/^Crew panel could not open: /)
+})
+
+test("after a reload the engine's list is read at once, so a listed agent that drops off still ends", async ($, on) => {
+  const clock = engine(on, 'claude-haiku-5-5')
+  let calls = 0
+  // Listed at session start only: the spawn's own look finds it gone already.
+  on('agent.list', () => ({ value: ++calls === 1 ? [{ id: 'z1', description: 'x', type: 'Explore', status: 'running' }] : [] }) as never)
+  await startSession($, on, false, ['TaskCreate'])
+  await spawn($, 'z1', 'Before the reload')
+  for (let i = 0; i < 40; i++) await clock.advance(4000)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /Running/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', label: '▾ Finished · 1' } as never)).toBeDefined()
+  await ui.unmount()
+})
+
+test('several tasks in progress all count as in flight', () => {
+  const plan = { ...emptyPlan(), title: 'P', steps: [
+    { id: '1', text: 'a', status: 'done' as const },
+    { id: '2', text: 'b', status: 'active' as const },
+    { id: '3', text: 'c', status: 'active' as const },
+    { id: '4', text: 'd', status: 'pending' as const },
+  ] }
+  const overview = overviewOf(plan, [])
+  expect(overview?.inFlight).toBe(2)
+  expect(overview?.label).toBe('P')
+})
+
+test('naming a row with the words it has leaves it as it is, so it keeps its place', () => {
+  const a = run({ type: 'skill', description: '/code-review' })
+  expect(namedRun(a, 'skill', '/code-review', '')).toBe(a)
+  expect(namedRun({ ...a, fromList: true }, 'skill', '/code-review', '')).not.toBe(a)
+  expect(namedRun(a, 'skill', '/simplify', '')).not.toBe(a)
 })
